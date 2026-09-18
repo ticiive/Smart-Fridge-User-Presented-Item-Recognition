@@ -20,8 +20,10 @@ import argparse
 import csv
 import io
 import logging
+import re
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -33,8 +35,9 @@ import yaml
 from PIL import Image
 
 
-OFF_API = "https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
+OFF_API    = "https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
 OFF_FIELDS = "code,product_name,brands,image_front_url,images"
+OFF_SEARCH = "https://world.openfoodfacts.org/cgi/search.pl"
 # Licença padrão das imagens do Open Food Facts
 OFF_IMAGE_LICENSE = "Creative Commons Attribution-ShareAlike 3.0 (CC BY-SA 3.0)"
 OFF_LICENSE_URL = "https://creativecommons.org/licenses/by-sa/3.0/"
@@ -156,12 +159,13 @@ def write_credits(credits: list[dict], catalog_dir: Path):
         "|---------|-----------------|-----------------|-------|---------|",
     ]
     for c in credits:
+        licenca = c.get("licenca", OFF_IMAGE_LICENSE)
         row = (
             f"| {c['arquivo']}.jpg "
             f"| {c['barcode']} "
             f"| {c['product_name']} "
             f"| {c['brands']} "
-            f"| {OFF_IMAGE_LICENSE} |"
+            f"| {licenca} |"
         )
         lines.append(row)
 
@@ -291,12 +295,15 @@ def _read_existing_credits(catalog_dir: Path) -> list[dict]:
         parts = [p.strip() for p in line.split("|") if p.strip()]
         if len(parts) >= 4:
             arquivo = parts[0].removesuffix(".jpg")
-            credits.append({
+            entry = {
                 "arquivo": arquivo,
                 "barcode": parts[1],
                 "product_name": parts[2],
                 "brands": parts[3],
-            })
+            }
+            if len(parts) >= 5:
+                entry["licenca"] = parts[4]
+            credits.append(entry)
     return credits
 
 
@@ -311,21 +318,342 @@ def _merge_credits(existing: list[dict], new: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Modo lote — utilitários
+# ---------------------------------------------------------------------------
+
+def normalizar_nome(text: str, max_len: int = 40) -> str:
+    """Texto livre → nome de arquivo: minúsculo, sem acento, sem espaço."""
+    text = text.lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = re.sub(r"[\s\-/\\]+", "_", text)
+    text = re.sub(r"[^\w]", "", text)   # mantém apenas [a-z0-9_]
+    text = re.sub(r"_+", "_", text)
+    text = text.strip("_")
+    return text[:max_len].rstrip("_")
+
+
+def gerar_nome_unico(nome_base: str, nomes_usados: set) -> str:
+    """Garante unicidade adicionando _2, _3 … em caso de colisão."""
+    if nome_base not in nomes_usados:
+        return nome_base
+    n = 2
+    while True:
+        sufixo = f"_{n}"
+        candidato = nome_base[:40 - len(sufixo)] + sufixo
+        if candidato not in nomes_usados:
+            return candidato
+        n += 1
+
+
+def buscar_off(
+    busca: Optional[str],
+    limite: int,
+    session: requests.Session,
+    logger: logging.Logger,
+) -> list[dict]:
+    """
+    Busca produtos no OFF filtrando por país Brasil e imagem frontal disponível.
+    Retorna lista de dicts com code, product_name, brands, image_front_url.
+    """
+    resultados: list[dict] = []
+    codigos_vistos: set = set()
+    pagina = 1
+    page_size = 100
+
+    while len(resultados) < limite:
+        params: dict = {
+            "action":        "process",
+            "tagtype_0":     "countries",
+            "tag_contains_0": "contains",
+            "tag_0":         "brazil",
+            "json":          "1",
+            "page_size":     page_size,
+            "page":          pagina,
+            "fields":        "code,product_name,brands,image_front_url",
+        }
+        if busca:
+            params["search_terms"] = busca
+
+        logger.info("  Buscando página %d  (coletados=%d / limite=%d)...",
+                    pagina, len(resultados), limite)
+        try:
+            resp = session.get(OFF_SEARCH, params=params, timeout=20)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning("  Falha na busca (página %d): %s", pagina, exc)
+            break
+
+        produtos = resp.json().get("products", [])
+        if not produtos:
+            logger.info("  Sem mais resultados na API.")
+            break
+
+        for p in produtos:
+            if len(resultados) >= limite:
+                break
+            code      = str(p.get("code") or "").strip()
+            pname     = (p.get("product_name") or "").strip()
+            image_url = (p.get("image_front_url") or "").strip()
+            if not code or not pname or not image_url:
+                continue
+            if code in codigos_vistos:
+                continue
+            codigos_vistos.add(code)
+            resultados.append({
+                "code":           code,
+                "product_name":   pname,
+                "brands":         (p.get("brands") or "").strip(),
+                "image_front_url": image_url,
+            })
+
+        # Menos resultados que page_size → não há próxima página
+        if len(produtos) < page_size:
+            break
+        pagina += 1
+        time.sleep(1.0)   # respeita o servidor entre páginas
+
+    logger.info("  Busca concluída: %d produto(s) com dados completos.", len(resultados))
+    return resultados
+
+
+def importar_manual(
+    catalog_dir: Path,
+    manual_dir: Path,
+    logger: logging.Logger,
+) -> list[dict]:
+    """
+    Copia catalogo_manual/*.jpg para catalogo/ quando ainda não há equivalente.
+    Retorna lista de dicts de crédito para acrescentar ao CREDITOS.md.
+    """
+    if not manual_dir.is_dir():
+        return []
+
+    EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    copiados: list[dict] = []
+    for src in sorted(manual_dir.iterdir()):
+        if src.suffix.lower() not in EXTS:
+            continue
+        dest = catalog_dir / f"{src.stem}.jpg"
+        if dest.exists():
+            logger.debug("  [manual] %s: já existe em catalogo/, ignorado", src.stem)
+            continue
+        try:
+            pil = Image.open(src).convert("RGB")
+            pil.save(dest, "JPEG", quality=95)
+        except Exception as exc:
+            logger.warning("  [manual] %s: falha ao copiar (%s)", src.stem, exc)
+            continue
+        logger.info("  [manual] %s → catalogo/", src.name)
+        copiados.append({
+            "arquivo":      src.stem,
+            "barcode":      "—",
+            "product_name": src.stem.replace("_", " "),
+            "brands":       "—",
+            "licenca":      "Manual (fornecida pelo usuário)",
+        })
+    return copiados
+
+
+def atualizar_csv(csv_path: Path, novos_items: list[dict]):
+    """
+    Acrescenta itens ao produtos.csv (cria com cabeçalho se não existir).
+    Cada item: {"barcode": str, "filename": str}.
+    Não duplica linhas já presentes (compara por codigo_de_barras).
+    """
+    codigos_existentes: set = set()
+    if csv_path.exists():
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                codigos_existentes.add(row.get("codigo_de_barras", "").strip())
+
+    novos = [i for i in novos_items if i["barcode"] not in codigos_existentes]
+    if not novos:
+        return
+
+    precisa_cabecalho = not csv_path.exists() or csv_path.stat().st_size == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["codigo_de_barras", "nome_do_arquivo"])
+        if precisa_cabecalho:
+            writer.writeheader()
+        for item in novos:
+            writer.writerow({
+                "codigo_de_barras": item["barcode"],
+                "nome_do_arquivo":  item["filename"],
+            })
+
+
+# ---------------------------------------------------------------------------
+# Pipeline de importação em lote
+# ---------------------------------------------------------------------------
+
+def process_lote(
+    busca: Optional[str],
+    limite: int,
+    csv_path: Path,
+    config: dict,
+    logger: logging.Logger,
+):
+    dl           = config["download"]
+    catalog_dir  = Path(dl["catalog_dir"])
+    rejected_dir = Path(dl["rejected_dir"])
+    manual_dir   = Path(config.get("catalog_manual_dir", "catalogo_manual"))
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    rejected_dir.mkdir(parents=True, exist_ok=True)
+
+    min_w, min_h  = dl["min_width"], dl["min_height"]
+    min_sharpness = dl["min_sharpness"]
+    delay         = dl["request_delay"]
+
+    session = requests.Session()
+    session.headers["User-Agent"] = dl["user_agent"]
+
+    EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+    # Nomes já em disco (evita colisão ao gerar novos nomes)
+    nomes_usados: set = {
+        p.stem for p in catalog_dir.iterdir() if p.suffix.lower() in EXTS
+    }
+    # Códigos já registrados no CSV (evita rebaixar)
+    codigos_no_csv: set = set()
+    if csv_path.exists():
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                codigos_no_csv.add(row.get("codigo_de_barras", "").strip())
+        logger.info("CSV existente: %d produto(s) já registrado(s).", len(codigos_no_csv))
+
+    # Busca
+    logger.info("Iniciando busca no Open Food Facts  (busca=%r, limite=%d)...",
+                busca or "<todos>", limite)
+    produtos = buscar_off(busca, limite, session, logger)
+
+    stats: dict = {"ok": 0, "ja_existe": 0, "rejeitado": 0, "erro": 0, "manual": 0}
+    motivos: dict = {}
+    credits_novos: list[dict] = []
+    csv_novos:     list[dict] = []
+
+    for i, prod in enumerate(produtos, 1):
+        code      = prod["code"]
+        pname     = prod["product_name"]
+        brands    = prod["brands"]
+        image_url = prod["image_front_url"]
+
+        logger.info("[%d/%d] %s | %s | %s", i, len(produtos), code, brands, pname)
+
+        if code in codigos_no_csv:
+            logger.info("  já no CSV, pulando.")
+            stats["ja_existe"] += 1
+            time.sleep(delay)
+            continue
+
+        # Gerar nome único
+        prefixo   = f"{brands}_{pname}" if brands else pname
+        nome_base = normalizar_nome(prefixo) or normalizar_nome(pname) or code
+        filename  = gerar_nome_unico(nome_base, nomes_usados)
+
+        dest          = catalog_dir  / f"{filename}.jpg"
+        rejected_dest = rejected_dir / f"{filename}.jpg"
+
+        if dest.exists():
+            logger.info("  arquivo já existe, registrando no CSV.")
+            nomes_usados.add(filename)
+            codigos_no_csv.add(code)
+            csv_novos.append({"barcode": code, "filename": filename})
+            stats["ja_existe"] += 1
+            time.sleep(delay)
+            continue
+
+        raw = download_image(image_url, session, logger)
+        if raw is None:
+            stats["erro"] += 1
+            time.sleep(delay)
+            continue
+
+        accepted, reason = check_image(raw, min_w, min_h, min_sharpness)
+        if not accepted:
+            logger.warning("  REJEITADO (%s): %s", filename, reason)
+            save_image(raw, rejected_dest)
+            (rejected_dir / f"{filename}.txt").write_text(reason + "\n", encoding="utf-8")
+            if "resolução" in reason or "resolucao" in reason:
+                chave = "resolução baixa"
+            elif "foco" in reason or "laplaciano" in reason:
+                chave = "imagem fora de foco"
+            else:
+                chave = "outro"
+            motivos[chave] = motivos.get(chave, 0) + 1
+            stats["rejeitado"] += 1
+        else:
+            save_image(raw, dest)
+            nomes_usados.add(filename)
+            codigos_no_csv.add(code)
+            logger.info("  OK  %s", filename)
+            credits_novos.append({
+                "arquivo":      filename,
+                "barcode":      code,
+                "product_name": pname,
+                "brands":       brands,
+            })
+            csv_novos.append({"barcode": code, "filename": filename})
+            stats["ok"] += 1
+
+        time.sleep(delay)
+
+    # Importar imagens da pasta manual
+    credits_manuais = importar_manual(catalog_dir, manual_dir, logger)
+    stats["manual"] = len(credits_manuais)
+
+    # Persistir CSV
+    if csv_novos:
+        atualizar_csv(csv_path, csv_novos)
+        logger.info("produtos.csv atualizado (+%d linha(s)): %s",
+                    len(csv_novos), csv_path)
+
+    # Atualizar CREDITOS.md
+    todos = credits_novos + credits_manuais
+    if todos:
+        merged = _merge_credits(_read_existing_credits(catalog_dir), todos)
+        write_credits(merged, catalog_dir)
+
+    # Resumo
+    logger.info("")
+    logger.info("=== Resumo (lote) ===")
+    logger.info("  Aceitos (API):       %d", stats["ok"])
+    logger.info("  Já existiam:         %d", stats["ja_existe"])
+    logger.info("  Rejeitados:          %d", stats["rejeitado"])
+    for motivo, n in sorted(motivos.items(), key=lambda x: -x[1]):
+        logger.info("    %-28s %d", motivo + ":", n)
+    logger.info("  Erros de download:   %d", stats["erro"])
+    logger.info("  Do catalogo_manual/: %d", stats["manual"])
+    logger.info("  CREDITOS.md:         %s", catalog_dir / "CREDITOS.md")
+
+
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", default="produtos.csv")
+    parser = argparse.ArgumentParser(
+        description="Baixa imagens do Open Food Facts para catalogo/."
+    )
+    parser.add_argument("--csv", default="produtos.csv",
+                        help="CSV de entrada (modo normal) ou saída (--lote)")
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--lote", action="store_true",
+                        help="Importação em lote sem código de barras")
+    parser.add_argument("--busca", default=None, metavar="TERMO",
+                        help="Termo de busca para --lote (ex: 'iogurte')")
+    parser.add_argument("--limite", type=int, default=30,
+                        help="Máximo de produtos a importar em --lote (padrão: 30)")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    logger = setup_logging(Path("logs"))
-
+    config   = load_config(args.config)
+    logger   = setup_logging(Path("logs"))
     csv_path = Path(args.csv)
-    if not csv_path.exists():
-        sys.exit(f"Arquivo não encontrado: {csv_path}")
 
-    process(csv_path, config, logger)
+    if args.lote:
+        process_lote(args.busca, args.limite, csv_path, config, logger)
+    else:
+        if not csv_path.exists():
+            sys.exit(f"Arquivo não encontrado: {csv_path}")
+        process(csv_path, config, logger)
 
 
 if __name__ == "__main__":
