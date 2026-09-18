@@ -28,6 +28,8 @@ index:
   # Onde o índice de embeddings é salvo em disco.
   path: "index/embeddings.npz"
 
+catalog_manual_dir: "catalogo_manual"
+
 download:
   # User-Agent enviado ao Open Food Facts. Obrigatório por política deles.
   # Formato recomendado: AppName/versão (URL-ou-email-de-contato)
