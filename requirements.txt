@@ -1,0 +1,7 @@
+open-clip-torch
+torch
+Pillow
+numpy
+pyyaml
+requests
+opencv-python

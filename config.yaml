@@ -1,0 +1,50 @@
+# Limiares de reconhecimento e enriquecimento do catálogo
+recognition:
+  # Similaridade mínima para declarar um produto reconhecido (0–1).
+  # Abaixo disso o sistema responde "não reconhecido".
+  similarity_threshold: 0.75
+
+  # Modelo CLIP a usar. Opções open_clip comuns:
+  #   ViT-B-32 / openai
+  #   ViT-L-14 / openai
+  #   ViT-B-16-plus-240 / laion400m_e31
+  clip_model: "ViT-B-32"
+  clip_pretrained: "openai"
+
+enrichment:
+  # Similaridade mínima para auto-adicionar um recorte ao catálogo.
+  # Deve ser bem mais alto que similarity_threshold.
+  add_threshold: 0.92
+
+  # Diferença mínima entre 1º e 2º colocados para aceitar a adição.
+  # Evita adicionar quando dois produtos estão quase empatados.
+  min_margin: 0.08
+
+  # Número máximo de referências extras por produto
+  # (a âncora original não conta neste limite).
+  max_extra_refs: 5
+
+index:
+  # Onde o índice de embeddings é salvo em disco.
+  path: "index/embeddings.npz"
+
+download:
+  # User-Agent enviado ao Open Food Facts. Obrigatório por política deles.
+  # Formato recomendado: AppName/versão (URL-ou-email-de-contato)
+  user_agent: "SmartFridge-IBMEC/1.0 (https://github.com/smart-fridge; lelervlldsz4@gmail.com)"
+
+  # Resolução mínima aceitável (largura x altura em pixels).
+  # Imagens menores que isso são rejeitadas.
+  min_width: 300
+  min_height: 300
+
+  # Variância mínima do Laplaciano (nitidez). Valores comuns: 50–200.
+  # Abaixo disso a imagem é considerada tremida/fora de foco.
+  min_sharpness: 80.0
+
+  # Pausa entre requisições à API (segundos) — respeita o servidor.
+  request_delay: 0.5
+
+  # Pastas de destino.
+  catalog_dir: "catalogo"
+  rejected_dir: "catalogo_rejeitado"
