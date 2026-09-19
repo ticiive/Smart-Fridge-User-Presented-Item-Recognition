@@ -37,7 +37,7 @@ from PIL import Image
 
 OFF_API    = "https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
 OFF_FIELDS = "code,product_name,brands,image_front_url,images"
-OFF_SEARCH = "https://world.openfoodfacts.org/cgi/search.pl"
+OFF_SEARCH = "https://search.openfoodfacts.org/search"   # Search-a-licious (v2)
 # Licença padrão das imagens do Open Food Facts
 OFF_IMAGE_LICENSE = "Creative Commons Attribution-ShareAlike 3.0 (CC BY-SA 3.0)"
 OFF_LICENSE_URL = "https://creativecommons.org/licenses/by-sa/3.0/"
@@ -353,43 +353,77 @@ def buscar_off(
     logger: logging.Logger,
 ) -> list[dict]:
     """
-    Busca produtos no OFF filtrando por país Brasil e imagem frontal disponível.
-    Retorna lista de dicts com code, product_name, brands, image_front_url.
+    Busca produtos no OFF via Search-a-licious, filtrando por Brasil.
+    Retorna lista normalizada com code, product_name, brands, image_front_url.
+
+    Endpoint: https://search.openfoodfacts.org/search
+    - q=""  funciona como coringa (sem --busca retorna ~10 000 produtos do Brasil)
+    - brands chega como lista; aqui é normalizado para string
+    - Retry com backoff exponencial em 503/429
     """
+    BACKOFF_BASE = 2.0
+    MAX_RETRIES  = 3
+    PAGE_SIZE    = 100
+
     resultados: list[dict] = []
     codigos_vistos: set = set()
     pagina = 1
-    page_size = 100
 
     while len(resultados) < limite:
         params: dict = {
-            "action":        "process",
-            "tagtype_0":     "countries",
-            "tag_contains_0": "contains",
-            "tag_0":         "brazil",
-            "json":          "1",
-            "page_size":     page_size,
-            "page":          pagina,
-            "fields":        "code,product_name,brands,image_front_url",
+            "q":              busca if busca else "",
+            "countries_tags": "en:brazil",
+            "page_size":      PAGE_SIZE,
+            "page":           pagina,
+            "fields":         "code,product_name,brands,image_front_url",
         }
-        if busca:
-            params["search_terms"] = busca
 
-        logger.info("  Buscando página %d  (coletados=%d / limite=%d)...",
+        logger.info("  [search-a-licious] página %d  (coletados=%d / limite=%d)...",
                     pagina, len(resultados), limite)
+
+        resp = None
+        for tentativa in range(1, MAX_RETRIES + 1):
+            try:
+                resp = session.get(OFF_SEARCH, params=params, timeout=20)
+            except requests.RequestException as exc:
+                logger.warning("  Erro de rede (tentativa %d/%d): %s",
+                               tentativa, MAX_RETRIES, exc)
+                if tentativa < MAX_RETRIES:
+                    time.sleep(BACKOFF_BASE ** tentativa)
+                resp = None
+                continue
+
+            if resp.status_code == 200:
+                break
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", BACKOFF_BASE ** tentativa))
+                logger.warning("  429 Rate-limit — aguardando %ds...", wait)
+                time.sleep(wait)
+            elif resp.status_code == 503:
+                wait = BACKOFF_BASE ** tentativa
+                logger.warning("  503 (tentativa %d/%d) — aguardando %.0fs...",
+                               tentativa, MAX_RETRIES, wait)
+                time.sleep(wait)
+            else:
+                logger.warning("  HTTP %d inesperado, abortando busca.", resp.status_code)
+                break
+
+        if resp is None or resp.status_code != 200:
+            logger.warning("  Busca abortada após %d tentativas.", MAX_RETRIES)
+            break
+
         try:
-            resp = session.get(OFF_SEARCH, params=params, timeout=20)
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            logger.warning("  Falha na busca (página %d): %s", pagina, exc)
+            data = resp.json()
+        except ValueError as exc:
+            logger.warning("  Resposta não é JSON válido: %s", exc)
             break
 
-        produtos = resp.json().get("products", [])
-        if not produtos:
-            logger.info("  Sem mais resultados na API.")
+        hits = data.get("hits", [])
+        if not hits:
+            logger.info("  Sem mais resultados.")
             break
 
-        for p in produtos:
+        for p in hits:
             if len(resultados) >= limite:
                 break
             code      = str(p.get("code") or "").strip()
@@ -399,17 +433,27 @@ def buscar_off(
                 continue
             if code in codigos_vistos:
                 continue
+
+            # Normaliza brands: Search-a-licious devolve lista, não string
+            brands_raw = p.get("brands")
+            if isinstance(brands_raw, list):
+                brands = ", ".join(str(b) for b in brands_raw if b)
+            else:
+                brands = str(brands_raw or "").strip()
+
             codigos_vistos.add(code)
             resultados.append({
-                "code":           code,
-                "product_name":   pname,
-                "brands":         (p.get("brands") or "").strip(),
+                "code":            code,
+                "product_name":    pname,
+                "brands":          brands,
                 "image_front_url": image_url,
             })
 
-        # Menos resultados que page_size → não há próxima página
-        if len(produtos) < page_size:
+        # Página incompleta → última página disponível
+        if len(hits) < PAGE_SIZE:
+            logger.info("  Última página (retornou %d < %d).", len(hits), PAGE_SIZE)
             break
+
         pagina += 1
         time.sleep(1.0)   # respeita o servidor entre páginas
 
