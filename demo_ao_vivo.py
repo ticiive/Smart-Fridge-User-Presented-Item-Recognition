@@ -62,7 +62,7 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 
 INFERENCIA_A_CADA_N_FRAMES = 5
-LIMIAR_INICIAL             = 0.56
+LIMIAR_INICIAL             = 0.63
 AQUECIMENTO_FRAMES         = 30
 LIMIAR_ESCURIDAO           = 5.0
 
@@ -118,7 +118,7 @@ _YOLO_FRUTA_SET = set(YOLO_CLASSES_FRUTA)  # lookup O(1)
 # Modo reconhecimento (--direcao nenhum): decisao ao fim da passagem
 PASSAGEM_TIMEOUT        = 8    # frames sem deteccao valida para encerrar a passagem
 PASSAGEM_INFERENCIA_N   = 2    # intervalo de inferencia durante a passagem (frames)
-MIN_ACERTOS_PASSAGEM    = 2    # minimo de inferencias aceitas para adicionar ao carrinho
+MIN_ACERTOS_PASSAGEM    = 1    # minimo de inferencias aceitas para adicionar ao carrinho
 MARGEM_MINIMA           = 0.02 # diferenca minima entre 1o e 2o do catalogo para aceitar
 
 # Trilha (--direcao area|linha)
