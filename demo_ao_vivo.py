@@ -41,11 +41,15 @@ Teclas:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
 import re
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -119,7 +123,13 @@ _YOLO_FRUTA_SET = set(YOLO_CLASSES_FRUTA)  # lookup O(1)
 PASSAGEM_TIMEOUT        = 8    # frames sem deteccao valida para encerrar a passagem
 PASSAGEM_INFERENCIA_N   = 2    # intervalo de inferencia durante a passagem (frames)
 MIN_ACERTOS_PASSAGEM    = 1    # minimo de inferencias aceitas para adicionar ao carrinho
+PASSAGEM_MIN_FRAMES     = 5    # passagens com menos frames sao ignoradas ao salvar
 MARGEM_MINIMA           = 0.02 # diferenca minima entre 1o e 2o do catalogo para aceitar
+
+# VLM local (--vlm)
+OLLAMA_URL          = "http://localhost:11434"
+OLLAMA_MODELO_VLM   = "qwen2.5vl:3b"
+OLLAMA_TIMEOUT_VLM  = 30   # segundos
 
 # Trilha (--direcao area|linha)
 TRILHA_FRAMES_TIMEOUT = 10
@@ -909,6 +919,71 @@ def listar_cameras():
 
 
 # ---------------------------------------------------------------------------
+# VLM local (Ollama) — usado com --vlm
+# ---------------------------------------------------------------------------
+
+def _chamar_ollama_vlm(recorte_bgr: np.ndarray, nomes: list) -> str:
+    """Envia recorte BGR ao Ollama e devolve nome exato da lista ou 'nenhum'."""
+    _, buf   = cv2.imencode(".jpg", recorte_bgr)
+    img_b64  = base64.b64encode(buf.tobytes()).decode()
+    lista    = "\n".join(f"- {n}" for n in nomes)
+    prompt   = (
+        "You are analyzing a food product image from a fridge camera.\n"
+        "Choose exactly one name from the catalog list below that matches "
+        "the product in the image.\n"
+        "If none match, respond: nenhum\n"
+        "Respond with ONLY the exact name or 'nenhum'. "
+        "No explanation, no punctuation, nothing else.\n\n"
+        f"Catalog:\n{lista}"
+    )
+    payload = json.dumps({
+        "model":   OLLAMA_MODELO_VLM,
+        "prompt":  prompt,
+        "images":  [img_b64],
+        "options": {"temperature": 0},
+        "stream":  False,
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT_VLM) as resp:
+        data = json.loads(resp.read())
+    resposta  = data.get("response", "").strip().strip("\"'")
+    nomes_set = set(nomes)
+    if resposta.lower() == "nenhum":
+        return "nenhum"
+    if resposta in nomes_set:
+        return resposta
+    resp_lower = resposta.lower()
+    for n in nomes:
+        if n.lower() == resp_lower:
+            return n
+    return f"invalida:{resposta[:40]}"
+
+
+def _thread_vlm(
+    recorte_bgr: np.ndarray,
+    clip_opiniao: str,
+    nomes_list: list,
+    vlm_lock: threading.Lock,
+    vlm_resultado: dict,
+    dados_evento: dict,
+) -> None:
+    try:
+        vlm = _chamar_ollama_vlm(recorte_bgr, nomes_list)
+    except Exception as exc:
+        print(f"\n  [vlm] erro: {exc}")
+        vlm = ""
+    with vlm_lock:
+        vlm_resultado["pronto"]       = True
+        vlm_resultado["vlm"]          = vlm
+        vlm_resultado["clip"]         = clip_opiniao
+        vlm_resultado["dados_evento"] = dados_evento
+
+
+# ---------------------------------------------------------------------------
 # Diagnostico de sessao
 # ---------------------------------------------------------------------------
 
@@ -1019,6 +1094,9 @@ def main():
     parser.add_argument("--listar-cameras",  action="store_true")
     parser.add_argument("--sem-frutas", action="store_true",
                         help="Desativa a via de frutas/hortifruti (so usa catalogo CLIP)")
+    parser.add_argument("--vlm", action="store_true",
+                        help="Verificar cada passagem com VLM local "
+                             f"(Ollama {OLLAMA_MODELO_VLM} em {OLLAMA_URL})")
     parser.add_argument(
         "--detector",
         choices=["fundo", "yolo"],
@@ -1110,7 +1188,28 @@ def main():
     direcao_ativa = (direcao_flag != "nenhum")
     modo_direcao  = direcao_flag if direcao_ativa else "area"  # estado interno do [l]
 
-    print(f"Modo inventario  : {direcao_flag}\n")
+    print(f"Modo inventario  : {direcao_flag}")
+
+    # ---- VLM local (--vlm) ----
+    usar_vlm = args.vlm
+    if usar_vlm:
+        print(f"VLM              : {OLLAMA_MODELO_VLM} em {OLLAMA_URL}")
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{OLLAMA_URL}/api/tags",
+                    headers={"User-Agent": "demo_ao_vivo/1.0"},
+                ),
+                timeout=2,
+            )
+            print("  Ollama disponivel. Aquecendo modelo...")
+            _dummy = np.zeros((8, 8, 3), dtype=np.uint8)
+            _chamar_ollama_vlm(_dummy, nomes[:3])
+            print("  VLM pronto.")
+        except Exception as exc:
+            print(f"  AVISO: Ollama nao encontrado ({exc}) — --vlm desativado.")
+            usar_vlm = False
+    print()
 
     if args.camera is not None:
         indice_camera = args.camera
@@ -1217,12 +1316,20 @@ def main():
     trilha_melhor_via: str = ""
 
     # ---- modo reconhecimento (--direcao nenhum): por passagem ----
-    passagem_ativa:          bool = False
-    passagem_frames_sem_det: int  = 0
-    passagem_frames_total:   int  = 0
-    passagem_inf_total:      int  = 0
-    passagem_acertos:        list = []  # (produto, sim, margem) por inferencia aceita
-    reconhec_bloqueado:      dict = {}  # {produto: inferencias_fora_passagem_sem_ver}
+    passagem_ativa:          bool  = False
+    passagem_frames_sem_det: int   = 0
+    passagem_frames_total:   int   = 0
+    passagem_inf_total:      int   = 0
+    passagem_acertos:        list  = []  # (produto, sim, margem) por inferencia aceita
+    reconhec_bloqueado:      dict  = {}
+    passagem_num:            int   = 0
+    passagem_melhor_crop             = None   # np.ndarray | None
+    passagem_melhor_sharp:   float  = 0.0
+
+    # ---- estado do VLM em thread ----
+    vlm_em_andamento = False
+    _vlm_lock        = threading.Lock()
+    _vlm_resultado:  dict = {}
 
     # ---- inventario e feedback ----
     inventario:   dict = {}
@@ -1240,6 +1347,8 @@ def main():
     sessao_ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
     sessao_crops_dir = logs_demo_dir / sessao_ts
     sessao_crops_dir.mkdir(exist_ok=True)
+    capturas_dir     = Path("capturas") / sessao_ts
+    capturas_dir.mkdir(parents=True, exist_ok=True)
     log_f = open(
         logs_demo_dir / f"sessao_{sessao_ts}.txt",
         "w", encoding="utf-8", buffering=1,
@@ -1393,11 +1502,20 @@ def main():
                 passagem_frames_total   = 0
                 passagem_inf_total      = 0
                 passagem_acertos        = []
+                passagem_melhor_crop    = None
+                passagem_melhor_sharp   = 0.0
 
             if passagem_ativa:
                 passagem_frames_total += 1
                 if det_valida:
                     passagem_frames_sem_det = 0
+                    _rc = frame[qy1:qy2, qx1:qx2]
+                    if _rc.size > 0:
+                        _gray  = cv2.cvtColor(_rc, cv2.COLOR_BGR2GRAY)
+                        _sharp = float(cv2.Laplacian(_gray, cv2.CV_64F).var())
+                        if _sharp > passagem_melhor_sharp:
+                            passagem_melhor_sharp = _sharp
+                            passagem_melhor_crop  = _rc.copy()
                 else:
                     passagem_frames_sem_det += 1
 
@@ -1412,6 +1530,10 @@ def main():
 
                 # Encerrar passagem apos PASSAGEM_TIMEOUT frames sem deteccao
                 if passagem_frames_sem_det >= PASSAGEM_TIMEOUT:
+                    _clip_opiniao = "nenhum"
+                    _decisao_pass = "SEM_REC"
+                    _sim_clip     = 0.0
+
                     if not passagem_acertos:
                         log_f.write(
                             f"  PASSAGEM_SEM_REC  dur={passagem_frames_total}fr"
@@ -1434,33 +1556,77 @@ def main():
                             f"{p}:{d['n']}({d['soma']:.2f})"
                             for p, d in sorted(por_prod.items())
                         )
+                        _clip_opiniao = vencedor
+                        _sim_clip     = dados["best"]
 
                         if dados["n"] < MIN_ACERTOS_PASSAGEM:
+                            _decisao_pass = "INSUF"
                             log_f.write(
                                 f"  PASSAGEM_INSUF  dur={passagem_frames_total}fr"
                                 f"  inf={passagem_inf_total}  aceit={len(passagem_acertos)}"
                                 f"  [{cnts_str}]  -> {vencedor}\n"
                             )
                         else:
-                            feedback_texto, feedback_cor = _processar_evento(
-                                "entrada", vencedor, dados["best"],
-                                inventario, eventos, modo_evento="reconhecimento",
-                                origem=produto_via.get(vencedor, "clip"),
-                            )
-                            _recorte_ev = frame[qy1:qy2, qx1:qx2]
-                            if _recorte_ev.size > 0:
-                                n_log_evento += 1
-                                _salvar_crop_log(_recorte_ev, sessao_crops_dir,
-                                                 "evento", n_log_evento, vencedor)
-                            feedback_ate = time.time() + FEEDBACK_DURACAO
+                            _decisao_pass = "OK"
+                            if not usar_vlm:
+                                feedback_texto, feedback_cor = _processar_evento(
+                                    "entrada", vencedor, dados["best"],
+                                    inventario, eventos, modo_evento="reconhecimento",
+                                    origem=produto_via.get(vencedor, "clip"),
+                                )
+                                _recorte_ev = frame[qy1:qy2, qx1:qx2]
+                                if _recorte_ev.size > 0:
+                                    n_log_evento += 1
+                                    _salvar_crop_log(_recorte_ev, sessao_crops_dir,
+                                                     "evento", n_log_evento, vencedor)
+                                feedback_ate = time.time() + FEEDBACK_DURACAO
                             log_f.write(
                                 f"  PASSAGEM_OK  dur={passagem_frames_total}fr"
                                 f"  inf={passagem_inf_total}  aceit={len(passagem_acertos)}"
                                 f"  [{cnts_str}]  -> {vencedor}\n"
                             )
 
+                    # Salvar recorte mais nitido (Change 1)
+                    if passagem_frames_total >= PASSAGEM_MIN_FRAMES and passagem_melhor_crop is not None:
+                        passagem_num += 1
+                        _crop_path = capturas_dir / f"passagem_{passagem_num:03d}.jpg"
+                        cv2.imwrite(str(_crop_path), passagem_melhor_crop)
+                        _crop_path.with_suffix(".json").write_text(
+                            json.dumps({
+                                "horario":       datetime.now().isoformat(timespec="seconds"),
+                                "duracao_fr":    passagem_frames_total,
+                                "n_inferencias": passagem_inf_total,
+                                "decisao":       _decisao_pass,
+                                "clip_vencedor": _clip_opiniao,
+                            }, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+
+                        # Submeter ao VLM em thread (Change 3)
+                        if usar_vlm:
+                            vlm_em_andamento = True
+                            threading.Thread(
+                                target=_thread_vlm,
+                                args=(
+                                    passagem_melhor_crop.copy(),
+                                    _clip_opiniao,
+                                    list(nomes),
+                                    _vlm_lock, _vlm_resultado,
+                                    {
+                                        "clip":    _clip_opiniao,
+                                        "sim":     _sim_clip,
+                                        "origem":  produto_via.get(_clip_opiniao, "clip")
+                                                   if _clip_opiniao != "nenhum" else "clip",
+                                        "decisao": _decisao_pass,
+                                    },
+                                ),
+                                daemon=True,
+                            ).start()
+
                     passagem_ativa          = False
                     passagem_frames_sem_det = 0
+                    passagem_melhor_crop    = None
+                    passagem_melhor_sharp   = 0.0
 
         # ---- Atualizar trilha (area / linha) ----
         linha_x_px = int(w * LINHA_X_FRAC)
@@ -1528,9 +1694,40 @@ def main():
             area_display  = None
             razao_display = None
 
+        # ---- Processar resultado VLM (se disponivel) ----
+        if usar_vlm:
+            with _vlm_lock:
+                if _vlm_resultado.get("pronto"):
+                    _res             = dict(_vlm_resultado)
+                    _vlm_resultado.clear()
+                    vlm_em_andamento = False
+                    _vlm_nome        = _res["vlm"]
+                    _clip_log        = _res["clip"]
+                    _concordam       = (_vlm_nome == _clip_log)
+                    _dados_v         = _res["dados_evento"]
+                    log_f.write(
+                        f"  VLM clip={_clip_log}  vlm={_vlm_nome}"
+                        f"  concord={_concordam}  decisao_clip={_dados_v['decisao']}\n"
+                    )
+                    nomes_set_vlm = set(nomes)
+                    if _vlm_nome and _vlm_nome != "nenhum" and _vlm_nome in nomes_set_vlm:
+                        feedback_texto, feedback_cor = _processar_evento(
+                            "entrada", _vlm_nome, _dados_v["sim"],
+                            inventario, eventos, modo_evento="reconhecimento",
+                            origem=_dados_v["origem"] + "+vlm",
+                        )
+                        _recorte_ev = frame[qy1:qy2, qx1:qx2]
+                        if _recorte_ev.size > 0:
+                            n_log_evento += 1
+                            _salvar_crop_log(_recorte_ev, sessao_crops_dir,
+                                             "evento", n_log_evento, _vlm_nome)
+                        feedback_ate = time.time() + FEEDBACK_DURACAO
+
         # ---- Construir reconhec_info ----
         reconhec_info = ""
-        if not direcao_ativa and passagem_ativa:
+        if usar_vlm and vlm_em_andamento:
+            reconhec_info = "VLM: verificando..."
+        elif not direcao_ativa and passagem_ativa:
             if passagem_acertos:
                 por_prod_hud: dict = {}
                 for prod, _, _ in passagem_acertos:

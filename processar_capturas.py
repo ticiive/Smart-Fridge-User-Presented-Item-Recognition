@@ -55,6 +55,16 @@ RESULTADOS_DIR = Path("resultados")
 CAPTURAS_DIR   = Path("capturas")
 LOGS_DEMO_DIR  = Path("logs_demo")
 
+_STOP_WORDS = {
+    # pt
+    "de", "da", "do", "das", "dos", "com", "sem", "por", "para", "em",
+    "um", "uma", "uns", "umas", "que", "nao", "sim", "ate", "sua", "seu",
+    "van", "les", "des", "aux", "une",
+    # en
+    "the", "and", "for", "with", "from", "are", "has", "not", "per",
+    "san", "mix",
+}
+
 
 # ---------------------------------------------------------------------------
 # Utilitarios
@@ -116,6 +126,41 @@ def gerar_palavras_yaml(nomes: list[str]) -> dict:
                 palavras.append(pn)
         resultado[nome] = palavras
     return resultado
+
+
+def construir_indice_palavras(palavras: dict) -> dict:
+    """
+    Retorna {palavra_normalizada: nome_produto} apenas para palavras que:
+      - tenham >= 3 letras
+      - nao sejam stop-word
+      - aparecam em EXATAMENTE UM produto do catalogo
+
+    Imprime as palavras descartadas por serem compartilhadas entre produtos.
+    """
+    contagem: dict = {}
+    for nome, kws in palavras.items():
+        for kw in kws:
+            kn = normalizar(kw)
+            if len(kn) < 3 or kn in _STOP_WORDS:
+                continue
+            if kn not in contagem:
+                contagem[kn] = []
+            if nome not in contagem[kn]:
+                contagem[kn].append(nome)
+
+    indice: dict = {}
+    compartilhadas = []
+    for kw, prods in sorted(contagem.items()):
+        if len(prods) == 1:
+            indice[kw] = prods[0]
+        else:
+            compartilhadas.append(kw)
+
+    if compartilhadas:
+        print(f"  Palavras descartadas (compartilhadas entre produtos): "
+              f"{', '.join(compartilhadas)}")
+    print(f"  {len(indice)} palavra(s) unicas para matching OCR.")
+    return indice
 
 
 # ---------------------------------------------------------------------------
@@ -194,18 +239,21 @@ def ocr_imagem(img_path: Path) -> str:
         return ""
 
 
-def match_palavras(texto: str, palavras: dict) -> str:
-    if not texto.strip() or not palavras:
+def match_palavras(texto: str, indice: dict) -> str:
+    """
+    indice: {palavra_normalizada: nome_produto} — saida de construir_indice_palavras.
+    Conta votos de palavras unicas encontradas no texto OCR.
+    """
+    if not texto.strip() or not indice:
         return "nenhum"
-    texto_norm  = normalizar(texto)
-    melhor      = "nenhum"
-    melhor_cnt  = 0
-    for nome, kws in palavras.items():
-        cnt = sum(1 for kw in kws if normalizar(kw) in texto_norm)
-        if cnt > melhor_cnt:
-            melhor_cnt = cnt
-            melhor     = nome
-    return melhor if melhor_cnt > 0 else "nenhum"
+    texto_norm = normalizar(texto)
+    votos: dict = {}
+    for kw, nome in indice.items():
+        if kw in texto_norm:
+            votos[nome] = votos.get(nome, 0) + 1
+    if not votos:
+        return "nenhum"
+    return max(votos, key=lambda n: votos[n])
 
 
 # ---------------------------------------------------------------------------
@@ -312,10 +360,13 @@ def coletar_imagens(sessao: Optional[str]) -> list[Path]:
                         if p.suffix.lower() in EXTENSOES
                     )
         if CAPTURAS_DIR.is_dir():
-            imagens += sorted(
-                p for p in CAPTURAS_DIR.iterdir()
-                if p.suffix.lower() in EXTENSOES
-            )
+            for item in sorted(CAPTURAS_DIR.iterdir()):
+                if item.is_dir():
+                    imagens += sorted(
+                        p for p in item.iterdir() if p.suffix.lower() in EXTENSOES
+                    )
+                elif item.suffix.lower() in EXTENSOES:
+                    imagens.append(item)
     return imagens
 
 
@@ -374,12 +425,13 @@ def main():
     nomes, embeddings = carregar_catalogo(catalog_dir, clip_model, preprocess, device)
     print(f"  {len(nomes)} produto(s) carregado(s).\n")
 
-    # Palavras-chave para OCR
-    palavras_ocr: dict = {}
+    # Palavras-chave para OCR — constroi indice de palavras unicas
+    indice_ocr: dict = {}
     if PALAVRAS_YAML.exists():
         with open(PALAVRAS_YAML, encoding="utf-8") as f:
             palavras_ocr = yaml.safe_load(f) or {}
         print(f"Palavras OCR: {PALAVRAS_YAML}  ({len(palavras_ocr)} entradas)")
+        indice_ocr = construir_indice_palavras(palavras_ocr)
     else:
         print(
             f"AVISO: {PALAVRAS_YAML} nao encontrado — OCR retornara 'nenhum' para tudo.\n"
@@ -431,7 +483,7 @@ def main():
 
             t0 = time.perf_counter()
             ocr_texto = ocr_imagem(img_path) if usar_ocr else ""
-            ocr_nome  = match_palavras(ocr_texto, palavras_ocr)
+            ocr_nome  = match_palavras(ocr_texto, indice_ocr)
             ocr_ms        = (time.perf_counter() - t0) * 1000
             if usar_ocr:
                 soma_ocr_ms += ocr_ms
