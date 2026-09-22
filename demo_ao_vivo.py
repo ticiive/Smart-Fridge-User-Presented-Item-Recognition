@@ -2,8 +2,8 @@
 Demo ao vivo — apresentacao AP1.
 
 Dois detectores:
-  --detector fundo  (padrao) — diferenca contra frame de referencia
-  --detector yolo             — YOLO-World vocabulario aberto
+  --detector yolo  (padrao) — YOLO-World vocabulario aberto
+  --detector fundo           — diferenca contra frame de referencia
 
 Tres modos de registro de inventario:
   --direcao nenhum  (padrao) — reconhecimento automatico por estabilidade
@@ -46,6 +46,7 @@ import csv
 import json
 import re
 import sys
+import queue
 import threading
 import time
 import urllib.error
@@ -973,27 +974,30 @@ def _chamar_ollama_vlm(recorte_bgr: np.ndarray, nomes: list) -> str:
     return f"invalida:{resposta[:40]}"
 
 
-def _thread_vlm(
-    recorte_bgr: np.ndarray,
-    clip_opiniao: str,
-    nomes_list: list,
-    vlm_lock: threading.Lock,
-    vlm_resultado: dict,
-    dados_evento: dict,
+def _worker_vlm(
+    fila_pedidos: queue.Queue,
+    fila_respostas: queue.Queue,
 ) -> None:
-    t0 = time.time()
-    try:
-        vlm = _chamar_ollama_vlm(recorte_bgr, nomes_list)
-    except Exception as exc:
-        print(f"\n  [vlm] erro: {exc}")
-        vlm = ""
-    vlm_duracao = time.time() - t0
-    with vlm_lock:
-        vlm_resultado["pronto"]       = True
-        vlm_resultado["vlm"]          = vlm
-        vlm_resultado["clip"]         = clip_opiniao
-        vlm_resultado["dados_evento"] = dados_evento
-        vlm_resultado["vlm_duracao"]  = vlm_duracao
+    """Worker unico: processa um pedido VLM por vez, devolve resposta na fila."""
+    while True:
+        pedido = fila_pedidos.get()
+        if pedido is None:
+            break
+        t0 = time.time()
+        try:
+            vlm = _chamar_ollama_vlm(pedido["crop"], pedido["nomes"])
+        except Exception as exc:
+            print(f"\n  [vlm] erro: {exc}")
+            vlm = ""
+        dur = time.time() - t0
+        fila_respostas.put({
+            "passagem_num": pedido["passagem_num"],
+            "vlm":          vlm,
+            "clip":         pedido["clip_opiniao"],
+            "dados_evento": pedido["dados_evento"],
+            "vlm_duracao":  dur,
+        })
+        fila_pedidos.task_done()
 
 
 # ---------------------------------------------------------------------------
@@ -1113,8 +1117,8 @@ def main():
     parser.add_argument(
         "--detector",
         choices=["fundo", "yolo"],
-        default="fundo",
-        help="'fundo': diferenca de fundo (padrao)  |  'yolo': YOLO-World vocabulario aberto",
+        default="yolo",
+        help="'yolo': YOLO-World vocabulario aberto (padrao)  |  'fundo': diferenca de fundo",
     )
     parser.add_argument(
         "--direcao",
@@ -1222,6 +1226,12 @@ def main():
         except Exception as exc:
             print(f"  AVISO: Ollama nao encontrado ({exc}) — --vlm desativado.")
             usar_vlm = False
+    if usar_vlm:
+        threading.Thread(
+            target=_worker_vlm,
+            args=(vlm_fila_pedidos, vlm_fila_respostas),
+            daemon=True,
+        ).start()
     print()
 
     if args.camera is not None:
@@ -1338,10 +1348,10 @@ def main():
     passagem_num:            int   = 0
     passagem_frames_dados:   list  = []  # {crop, yolo_classe, yolo_conf, clip_sim, sharp}
 
-    # ---- estado do VLM em thread ----
-    vlm_em_andamento = False
-    _vlm_lock        = threading.Lock()
-    _vlm_resultado:  dict = {}
+    # ---- estado do VLM em fila ----
+    vlm_fila_pedidos:   queue.Queue = queue.Queue()
+    vlm_fila_respostas: queue.Queue = queue.Queue()
+    vlm_pendentes: int = 0
 
     # ---- relatorio de sessao ----
     relatorio_passagens:   list = []  # passagens salvas
@@ -1604,18 +1614,17 @@ def main():
                             )
                         else:
                             _decisao_pass = "OK"
-                            if not usar_vlm:
-                                feedback_texto, feedback_cor = _processar_evento(
-                                    "entrada", vencedor, dados["best"],
-                                    inventario, eventos, modo_evento="reconhecimento",
-                                    origem=produto_via.get(vencedor, "clip"),
-                                )
-                                _recorte_ev = frame[qy1:qy2, qx1:qx2]
-                                if _recorte_ev.size > 0:
-                                    n_log_evento += 1
-                                    _salvar_crop_log(_recorte_ev, sessao_crops_dir,
-                                                     "evento", n_log_evento, vencedor)
-                                feedback_ate = time.time() + FEEDBACK_DURACAO
+                            feedback_texto, feedback_cor = _processar_evento(
+                                "entrada", vencedor, dados["best"],
+                                inventario, eventos, modo_evento="reconhecimento",
+                                origem=produto_via.get(vencedor, "clip"),
+                            )
+                            _recorte_ev = frame[qy1:qy2, qx1:qx2]
+                            if _recorte_ev.size > 0:
+                                n_log_evento += 1
+                                _salvar_crop_log(_recorte_ev, sessao_crops_dir,
+                                                 "evento", n_log_evento, vencedor)
+                            feedback_ate = time.time() + FEEDBACK_DURACAO
                             log_f.write(
                                 f"  PASSAGEM_OK  dur={passagem_frames_total}fr"
                                 f"  inf={passagem_inf_total}  aceit={len(passagem_acertos)}"
@@ -1696,7 +1705,13 @@ def main():
                                 }, ensure_ascii=False, indent=2),
                                 encoding="utf-8",
                             )
+                            _quem_decidiu_init = (
+                                "clip" if _decisao_pass == "OK"
+                                else None if (usar_vlm and _decisao_pass == "SEM_REC")
+                                else "ninguem"
+                            )
                             relatorio_passagens.append({
+                                "num":           passagem_num,
                                 "horario":       datetime.now().isoformat(
                                     timespec="seconds"
                                 ),
@@ -1706,29 +1721,23 @@ def main():
                                 "clip_vencedor": _clip_opiniao,
                                 "vlm_nome":      None,
                                 "vlm_duracao_s": None,
+                                "quem_decidiu":  _quem_decidiu_init,
                             })
 
-                            if usar_vlm:
-                                vlm_em_andamento = True
-                                threading.Thread(
-                                    target=_thread_vlm,
-                                    args=(
-                                        _melhor_fd["crop"].copy(),
-                                        _clip_opiniao,
-                                        list(nomes),
-                                        _vlm_lock, _vlm_resultado,
-                                        {
-                                            "clip":    _clip_opiniao,
-                                            "sim":     _sim_clip,
-                                            "origem":  (
-                                                produto_via.get(_clip_opiniao, "clip")
-                                                if _clip_opiniao != "nenhum" else "clip"
-                                            ),
-                                            "decisao": _decisao_pass,
-                                        },
-                                    ),
-                                    daemon=True,
-                                ).start()
+                            if usar_vlm and _decisao_pass == "SEM_REC":
+                                vlm_fila_pedidos.put({
+                                    "passagem_num": passagem_num,
+                                    "crop":         _melhor_fd["crop"].copy(),
+                                    "clip_opiniao": _clip_opiniao,
+                                    "nomes":        list(nomes),
+                                    "dados_evento": {
+                                        "clip":    _clip_opiniao,
+                                        "sim":     _sim_clip,
+                                        "origem":  "clip",
+                                        "decisao": _decisao_pass,
+                                    },
+                                })
+                                vlm_pendentes += 1
 
                     # Resetar estado da passagem
                     passagem_ativa          = False
@@ -1827,21 +1836,25 @@ def main():
 
         # ---- Processar resultado VLM (se disponivel) ----
         if usar_vlm:
-            with _vlm_lock:
-                if _vlm_resultado.get("pronto"):
-                    _res             = dict(_vlm_resultado)
-                    _vlm_resultado.clear()
-                    vlm_em_andamento = False
-                    _vlm_nome        = _res["vlm"]
-                    _clip_log        = _res["clip"]
-                    _concordam       = (_vlm_nome == _clip_log)
-                    _dados_v         = _res["dados_evento"]
-                    _vlm_dur         = _res.get("vlm_duracao", 0.0)
-                    if relatorio_passagens and relatorio_passagens[-1]["vlm_nome"] is None:
-                        relatorio_passagens[-1]["vlm_nome"]     = _vlm_nome
-                        relatorio_passagens[-1]["vlm_duracao_s"] = round(_vlm_dur, 2)
+            try:
+                while True:
+                    _res       = vlm_fila_respostas.get_nowait()
+                    vlm_pendentes -= 1
+                    _pass_num  = _res["passagem_num"]
+                    _vlm_nome  = _res["vlm"]
+                    _clip_log  = _res["clip"]
+                    _concordam = (_vlm_nome == _clip_log)
+                    _dados_v   = _res["dados_evento"]
+                    _vlm_dur   = _res.get("vlm_duracao", 0.0)
+                    _rp = next(
+                        (p for p in relatorio_passagens if p["num"] == _pass_num),
+                        None,
+                    )
+                    if _rp is not None:
+                        _rp["vlm_nome"]      = _vlm_nome
+                        _rp["vlm_duracao_s"] = round(_vlm_dur, 2)
                     log_f.write(
-                        f"  VLM clip={_clip_log}  vlm={_vlm_nome}"
+                        f"  VLM passagem={_pass_num}  clip={_clip_log}  vlm={_vlm_nome}"
                         f"  concord={_concordam}  decisao_clip={_dados_v['decisao']}\n"
                     )
                     nomes_set_vlm = set(nomes)
@@ -1849,19 +1862,26 @@ def main():
                         feedback_texto, feedback_cor = _processar_evento(
                             "entrada", _vlm_nome, _dados_v["sim"],
                             inventario, eventos, modo_evento="reconhecimento",
-                            origem=_dados_v["origem"] + "+vlm",
+                            origem="vlm",
                         )
+                        if _rp is not None:
+                            _rp["quem_decidiu"] = "vlm"
                         _recorte_ev = frame[qy1:qy2, qx1:qx2]
                         if _recorte_ev.size > 0:
                             n_log_evento += 1
                             _salvar_crop_log(_recorte_ev, sessao_crops_dir,
                                              "evento", n_log_evento, _vlm_nome)
                         feedback_ate = time.time() + FEEDBACK_DURACAO
+                    else:
+                        if _rp is not None:
+                            _rp["quem_decidiu"] = "ninguem"
+            except queue.Empty:
+                pass
 
         # ---- Construir reconhec_info ----
         reconhec_info = ""
-        if usar_vlm and vlm_em_andamento:
-            reconhec_info = "VLM: verificando..."
+        if usar_vlm and vlm_pendentes > 0:
+            reconhec_info = f"VLM: {vlm_pendentes} na fila"
         elif not direcao_ativa and passagem_ativa:
             if passagem_acertos:
                 por_prod_hud: dict = {}
@@ -2081,6 +2101,9 @@ def main():
                 )
             else:
                 rf.write(f"  vlm:           (nao usado)\n")
+            rf.write(
+                f"  quem_decidiu:  {_p.get('quem_decidiu') or '(pendente)'}\n"
+            )
     print(f"Relatorio       : {rel_path}")
 
 
