@@ -1,0 +1,64 @@
+# Palavras-chave por produto para matching de OCR.
+# Adicione sinonimos, abreviacoes e variacoes de escrita.
+# Exemplo:  heinz_mostarda: [heinz, mostarda, mustard, ketchup]
+
+birds_eye_bi:
+- birds
+- eye
+- bi
+bis_oreo:
+- bis
+- oreo
+coca_zero:
+- coca
+- zero
+heinz_maionese:
+- heinz
+- maionese
+heinz_maionese_heinz_gorgonzola_215_g:
+- heinz
+- maionese
+- gorgonzola
+heinz_mostarda:
+- heinz
+- mostarda
+linguica:
+- linguica
+maizena_maizena:
+- maizena
+nissin_lamen:
+- nissin
+- lamen
+paladin_moutarde:
+- paladin
+- moutarde
+perdigao_fusilli_com_tiras_de_frango_per:
+- perdigao
+- fusilli
+- com
+- tiras
+- de
+- frango
+- per
+piraque_piraque_recheado_supreme_limao:
+- piraque
+- recheado
+- supreme
+- limao
+red_bull:
+- red
+- bull
+ruffles_ruffles:
+- ruffles
+toddy:
+- toddy
+toupargel_6_crepes_roulees_jambon_emment:
+- toupargel
+- crepes
+- roulees
+- jambon
+- emment
+uniliver_atole_chocolate:
+- uniliver
+- atole
+- chocolate
