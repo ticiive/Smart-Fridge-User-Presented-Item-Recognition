@@ -124,12 +124,13 @@ PASSAGEM_TIMEOUT        = 8    # frames sem deteccao valida para encerrar a pass
 PASSAGEM_INFERENCIA_N   = 2    # intervalo de inferencia durante a passagem (frames)
 MIN_ACERTOS_PASSAGEM    = 1    # minimo de inferencias aceitas para adicionar ao carrinho
 PASSAGEM_MIN_FRAMES     = 5    # passagens com menos frames sao ignoradas ao salvar
+PASSAGEM_MAX_FRAMES     = 60   # passagem com mais que isso e forcadamente encerrada
 MARGEM_MINIMA           = 0.02 # diferenca minima entre 1o e 2o do catalogo para aceitar
 
 # VLM local (--vlm)
 OLLAMA_URL          = "http://localhost:11434"
 OLLAMA_MODELO_VLM   = "qwen2.5vl:3b"
-OLLAMA_TIMEOUT_VLM  = 30   # segundos
+OLLAMA_TIMEOUT_VLM  = 60   # segundos
 
 # Trilha (--direcao area|linha)
 TRILHA_FRAMES_TIMEOUT = 10
@@ -924,6 +925,15 @@ def listar_cameras():
 
 def _chamar_ollama_vlm(recorte_bgr: np.ndarray, nomes: list) -> str:
     """Envia recorte BGR ao Ollama e devolve nome exato da lista ou 'nenhum'."""
+    h_rc, w_rc = recorte_bgr.shape[:2]
+    maior = max(h_rc, w_rc)
+    if maior > 448:
+        escala = 448 / maior
+        recorte_bgr = cv2.resize(
+            recorte_bgr,
+            (max(1, int(w_rc * escala)), max(1, int(h_rc * escala))),
+            interpolation=cv2.INTER_AREA,
+        )
     _, buf   = cv2.imencode(".jpg", recorte_bgr)
     img_b64  = base64.b64encode(buf.tobytes()).decode()
     lista    = "\n".join(f"- {n}" for n in nomes)
@@ -971,16 +981,19 @@ def _thread_vlm(
     vlm_resultado: dict,
     dados_evento: dict,
 ) -> None:
+    t0 = time.time()
     try:
         vlm = _chamar_ollama_vlm(recorte_bgr, nomes_list)
     except Exception as exc:
         print(f"\n  [vlm] erro: {exc}")
         vlm = ""
+    vlm_duracao = time.time() - t0
     with vlm_lock:
         vlm_resultado["pronto"]       = True
         vlm_resultado["vlm"]          = vlm
         vlm_resultado["clip"]         = clip_opiniao
         vlm_resultado["dados_evento"] = dados_evento
+        vlm_resultado["vlm_duracao"]  = vlm_duracao
 
 
 # ---------------------------------------------------------------------------
@@ -1323,13 +1336,17 @@ def main():
     passagem_acertos:        list  = []  # (produto, sim, margem) por inferencia aceita
     reconhec_bloqueado:      dict  = {}
     passagem_num:            int   = 0
-    passagem_melhor_crop             = None   # np.ndarray | None
-    passagem_melhor_sharp:   float  = 0.0
+    passagem_frames_dados:   list  = []  # {crop, yolo_classe, yolo_conf, clip_sim, sharp}
 
     # ---- estado do VLM em thread ----
     vlm_em_andamento = False
     _vlm_lock        = threading.Lock()
     _vlm_resultado:  dict = {}
+
+    # ---- relatorio de sessao ----
+    relatorio_passagens:   list = []  # passagens salvas
+    relatorio_descartadas: list = []  # (duracao_fr, motivo)
+    relatorio_cortadas:    int  = 0
 
     # ---- inventario e feedback ----
     inventario:   dict = {}
@@ -1502,8 +1519,7 @@ def main():
                 passagem_frames_total   = 0
                 passagem_inf_total      = 0
                 passagem_acertos        = []
-                passagem_melhor_crop    = None
-                passagem_melhor_sharp   = 0.0
+                passagem_frames_dados   = []
 
             if passagem_ativa:
                 passagem_frames_total += 1
@@ -1513,9 +1529,18 @@ def main():
                     if _rc.size > 0:
                         _gray  = cv2.cvtColor(_rc, cv2.COLOR_BGR2GRAY)
                         _sharp = float(cv2.Laplacian(_gray, cv2.CV_64F).var())
-                        if _sharp > passagem_melhor_sharp:
-                            passagem_melhor_sharp = _sharp
-                            passagem_melhor_crop  = _rc.copy()
+                        _clip_sim_frame = (
+                            similaridade_atual
+                            if inferencia_rodou and via_ident == "catalogo"
+                            else None
+                        )
+                        passagem_frames_dados.append({
+                            "crop":        _rc.copy(),
+                            "yolo_classe": yolo_classe_atual,
+                            "yolo_conf":   yolo_conf_atual,
+                            "clip_sim":    _clip_sim_frame,
+                            "sharp":       _sharp,
+                        })
                 else:
                     passagem_frames_sem_det += 1
 
@@ -1528,11 +1553,22 @@ def main():
                         )
                         produto_via[melhor_palpite] = via_ident
 
-                # Encerrar passagem apos PASSAGEM_TIMEOUT frames sem deteccao
-                if passagem_frames_sem_det >= PASSAGEM_TIMEOUT:
+                # Encerrar passagem: timeout ou corte por excesso de frames
+                _passou_max     = (passagem_frames_total >= PASSAGEM_MAX_FRAMES)
+                _passou_timeout = (passagem_frames_sem_det >= PASSAGEM_TIMEOUT)
+
+                if _passou_max or _passou_timeout:
+                    _cortada      = _passou_max and not _passou_timeout
                     _clip_opiniao = "nenhum"
                     _decisao_pass = "SEM_REC"
                     _sim_clip     = 0.0
+
+                    if _cortada:
+                        log_f.write(
+                            f"  PASSAGEM_CORTADA_LONGA  dur={passagem_frames_total}fr"
+                            f"  inf={passagem_inf_total}\n"
+                        )
+                        relatorio_cortadas += 1
 
                     if not passagem_acertos:
                         log_f.write(
@@ -1586,47 +1622,142 @@ def main():
                                 f"  [{cnts_str}]  -> {vencedor}\n"
                             )
 
-                    # Salvar recorte mais nitido (Change 1)
-                    if passagem_frames_total >= PASSAGEM_MIN_FRAMES and passagem_melhor_crop is not None:
-                        passagem_num += 1
-                        _crop_path = capturas_dir / f"passagem_{passagem_num:03d}.jpg"
-                        cv2.imwrite(str(_crop_path), passagem_melhor_crop)
-                        _crop_path.with_suffix(".json").write_text(
-                            json.dumps({
-                                "horario":       datetime.now().isoformat(timespec="seconds"),
+                    # Selecionar melhor recorte e salvar (ou descartar)
+                    _n_clip_inf = sum(
+                        1 for fd in passagem_frames_dados if fd["clip_sim"] is not None
+                    )
+                    _descartar_motivo = None
+                    if passagem_frames_total < PASSAGEM_MIN_FRAMES:
+                        _descartar_motivo = "muito_curta"
+                    elif _n_clip_inf == 0:
+                        _descartar_motivo = "sem_clip"
+                    elif not passagem_frames_dados:
+                        _descartar_motivo = "sem_produto"
+
+                    if _descartar_motivo:
+                        log_f.write(
+                            f"  PASSAGEM_DESCARTADA  dur={passagem_frames_total}fr"
+                            f"  motivo={_descartar_motivo}\n"
+                        )
+                        relatorio_descartadas.append(
+                            (passagem_frames_total, _descartar_motivo)
+                        )
+                    else:
+                        _com_clip = [fd for fd in passagem_frames_dados
+                                     if fd["clip_sim"] is not None]
+                        if _com_clip:
+                            _melhor_fd = max(
+                                _com_clip, key=lambda fd: (fd["clip_sim"], fd["sharp"])
+                            )
+                            _criterio = "clip"
+                        else:
+                            _prod_fds = [
+                                fd for fd in passagem_frames_dados
+                                if fd["yolo_classe"]
+                                and fd["yolo_classe"] not in YOLO_DESCARTAR
+                            ]
+                            if _prod_fds:
+                                _melhor_fd = max(
+                                    _prod_fds,
+                                    key=lambda fd: (fd["yolo_conf"], fd["sharp"]),
+                                )
+                                _criterio = "yolo"
+                            elif passagem_frames_dados:
+                                _melhor_fd = max(
+                                    passagem_frames_dados, key=lambda fd: fd["sharp"]
+                                )
+                                _criterio = "nitidez"
+                            else:
+                                _melhor_fd = None
+                                _criterio  = "nenhum"
+
+                        if _melhor_fd is not None:
+                            passagem_num += 1
+                            _crop_path = capturas_dir / f"passagem_{passagem_num:03d}.jpg"
+                            cv2.imwrite(str(_crop_path), _melhor_fd["crop"])
+                            _sim_recorte = (
+                                _melhor_fd["clip_sim"]
+                                if _melhor_fd["clip_sim"] is not None
+                                else 0.0
+                            )
+                            _crop_path.with_suffix(".json").write_text(
+                                json.dumps({
+                                    "horario":          datetime.now().isoformat(
+                                        timespec="seconds"
+                                    ),
+                                    "duracao_fr":       passagem_frames_total,
+                                    "n_inferencias":    passagem_inf_total,
+                                    "decisao":          _decisao_pass,
+                                    "clip_vencedor":    _clip_opiniao,
+                                    "sim_clip_recorte": round(_sim_recorte, 4),
+                                    "classe_yolo":      _melhor_fd["yolo_classe"],
+                                    "conf_yolo":        round(_melhor_fd["yolo_conf"], 4),
+                                    "criterio_escolha": _criterio,
+                                }, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                            relatorio_passagens.append({
+                                "horario":       datetime.now().isoformat(
+                                    timespec="seconds"
+                                ),
                                 "duracao_fr":    passagem_frames_total,
                                 "n_inferencias": passagem_inf_total,
-                                "decisao":       _decisao_pass,
+                                "decisao_clip":  _decisao_pass,
                                 "clip_vencedor": _clip_opiniao,
-                            }, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
-                        )
+                                "vlm_nome":      None,
+                                "vlm_duracao_s": None,
+                            })
 
-                        # Submeter ao VLM em thread (Change 3)
-                        if usar_vlm:
-                            vlm_em_andamento = True
-                            threading.Thread(
-                                target=_thread_vlm,
-                                args=(
-                                    passagem_melhor_crop.copy(),
-                                    _clip_opiniao,
-                                    list(nomes),
-                                    _vlm_lock, _vlm_resultado,
-                                    {
-                                        "clip":    _clip_opiniao,
-                                        "sim":     _sim_clip,
-                                        "origem":  produto_via.get(_clip_opiniao, "clip")
-                                                   if _clip_opiniao != "nenhum" else "clip",
-                                        "decisao": _decisao_pass,
-                                    },
-                                ),
-                                daemon=True,
-                            ).start()
+                            if usar_vlm:
+                                vlm_em_andamento = True
+                                threading.Thread(
+                                    target=_thread_vlm,
+                                    args=(
+                                        _melhor_fd["crop"].copy(),
+                                        _clip_opiniao,
+                                        list(nomes),
+                                        _vlm_lock, _vlm_resultado,
+                                        {
+                                            "clip":    _clip_opiniao,
+                                            "sim":     _sim_clip,
+                                            "origem":  (
+                                                produto_via.get(_clip_opiniao, "clip")
+                                                if _clip_opiniao != "nenhum" else "clip"
+                                            ),
+                                            "decisao": _decisao_pass,
+                                        },
+                                    ),
+                                    daemon=True,
+                                ).start()
 
+                    # Resetar estado da passagem
                     passagem_ativa          = False
                     passagem_frames_sem_det = 0
-                    passagem_melhor_crop    = None
-                    passagem_melhor_sharp   = 0.0
+                    passagem_frames_dados   = []
+                    passagem_frames_total   = 0
+                    passagem_inf_total      = 0
+                    passagem_acertos        = []
+
+                    # Se foi cortada e ainda ha deteccao, abrir nova passagem imediatamente
+                    if _cortada and det_valida:
+                        passagem_ativa        = True
+                        passagem_frames_total = 1
+                        _rc2 = frame[qy1:qy2, qx1:qx2]
+                        if _rc2.size > 0:
+                            _gray2  = cv2.cvtColor(_rc2, cv2.COLOR_BGR2GRAY)
+                            _sharp2 = float(cv2.Laplacian(_gray2, cv2.CV_64F).var())
+                            _clip_sim2 = (
+                                similaridade_atual
+                                if inferencia_rodou and via_ident == "catalogo"
+                                else None
+                            )
+                            passagem_frames_dados.append({
+                                "crop":        _rc2.copy(),
+                                "yolo_classe": yolo_classe_atual,
+                                "yolo_conf":   yolo_conf_atual,
+                                "clip_sim":    _clip_sim2,
+                                "sharp":       _sharp2,
+                            })
 
         # ---- Atualizar trilha (area / linha) ----
         linha_x_px = int(w * LINHA_X_FRAC)
@@ -1705,6 +1836,10 @@ def main():
                     _clip_log        = _res["clip"]
                     _concordam       = (_vlm_nome == _clip_log)
                     _dados_v         = _res["dados_evento"]
+                    _vlm_dur         = _res.get("vlm_duracao", 0.0)
+                    if relatorio_passagens and relatorio_passagens[-1]["vlm_nome"] is None:
+                        relatorio_passagens[-1]["vlm_nome"]     = _vlm_nome
+                        relatorio_passagens[-1]["vlm_duracao_s"] = round(_vlm_dur, 2)
                     log_f.write(
                         f"  VLM clip={_clip_log}  vlm={_vlm_nome}"
                         f"  concord={_concordam}  decisao_clip={_dados_v['decisao']}\n"
@@ -1860,7 +1995,10 @@ def main():
             reconhec_bloqueado.clear()
             passagem_ativa          = False
             passagem_frames_sem_det = 0
+            passagem_frames_total   = 0
+            passagem_inf_total      = 0
             passagem_acertos        = []
+            passagem_frames_dados   = []
             feedback_texto = "Inventario zerado"
             feedback_cor   = COR_AMARELO
             feedback_ate   = time.time() + FEEDBACK_DURACAO
@@ -1915,6 +2053,35 @@ def main():
     log_f.close()
     print(f"Log de sessao : logs_demo/sessao_{sessao_ts}.txt")
     print(f"Recortes      : {sessao_crops_dir}  ({n_log_evento} arquivo(s))")
+
+    relatorios_dir = Path("relatorios")
+    relatorios_dir.mkdir(exist_ok=True)
+    rel_path = relatorios_dir / f"demo_{sessao_ts}.txt"
+    with open(rel_path, "w", encoding="utf-8") as rf:
+        rf.write(f"Sessao           : {sessao_ts}\n")
+        rf.write(f"Passagens salvas : {len(relatorio_passagens)}\n")
+        rf.write(f"Descartadas      : {len(relatorio_descartadas)}\n")
+        rf.write(f"Cortadas (longa) : {relatorio_cortadas}\n")
+        if relatorio_descartadas:
+            rf.write("Descartadas detalhe:\n")
+            for _dur, _mot in relatorio_descartadas:
+                rf.write(f"  dur={_dur}fr  motivo={_mot}\n")
+        rf.write("-" * 60 + "\n")
+        for _i, _p in enumerate(relatorio_passagens, 1):
+            rf.write(f"Passagem {_i:03d}\n")
+            rf.write(f"  horario:       {_p['horario']}\n")
+            rf.write(f"  duracao_fr:    {_p['duracao_fr']}\n")
+            rf.write(f"  n_inferencias: {_p['n_inferencias']}\n")
+            rf.write(
+                f"  decisao_clip:  {_p['decisao_clip']}  ({_p['clip_vencedor']})\n"
+            )
+            if _p["vlm_nome"] is not None:
+                rf.write(
+                    f"  vlm:           {_p['vlm_nome']}  ({_p['vlm_duracao_s']:.1f}s)\n"
+                )
+            else:
+                rf.write(f"  vlm:           (nao usado)\n")
+    print(f"Relatorio       : {rel_path}")
 
 
 if __name__ == "__main__":
