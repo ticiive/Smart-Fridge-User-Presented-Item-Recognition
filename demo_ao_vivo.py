@@ -1226,6 +1226,8 @@ def main():
         except Exception as exc:
             print(f"  AVISO: Ollama nao encontrado ({exc}) — --vlm desativado.")
             usar_vlm = False
+    vlm_fila_pedidos:   queue.Queue = queue.Queue()
+    vlm_fila_respostas: queue.Queue = queue.Queue()
     if usar_vlm:
         threading.Thread(
             target=_worker_vlm,
@@ -1349,8 +1351,6 @@ def main():
     passagem_frames_dados:   list  = []  # {crop, yolo_classe, yolo_conf, clip_sim, sharp}
 
     # ---- estado do VLM em fila ----
-    vlm_fila_pedidos:   queue.Queue = queue.Queue()
-    vlm_fila_respostas: queue.Queue = queue.Queue()
     vlm_pendentes: int = 0
 
     # ---- relatorio de sessao ----
