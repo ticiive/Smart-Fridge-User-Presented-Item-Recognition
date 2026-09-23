@@ -157,7 +157,7 @@ def _ocr_array(arr: np.ndarray) -> str:
         request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
         request.setRecognitionLanguages_(["pt-BR", "en-US"])
         request.setUsesLanguageCorrection_(True)
-        handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(url, {})
+        handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(url, None)
         handler.performRequests_error_([request], None)
         results = request.results()
         if not results:
