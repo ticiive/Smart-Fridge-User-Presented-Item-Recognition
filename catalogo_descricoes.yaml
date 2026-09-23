@@ -1,0 +1,20 @@
+# Descrições em português para os produtos do catálogo — usadas no prompt do VLM.
+# REVISE E AJUSTE cada descrição manualmente antes da demonstração.
+# Formato: identificador: "descrição curta e objetiva do produto"
+
+birds_eye_bi: "Birds Eye Bi, pacote de legumes congelados mistos"
+bis_oreo: "Bis Oreo, caixa de chocolate Lacta com biscoito Oreo"
+coca_zero: "Coca-Cola Zero Açúcar, garrafa PET preta e vermelha"
+heinz_maionese: "Heinz Maionese, pote de maionese amarela"
+heinz_mostarda: "Heinz Mostarda, bisnaga de mostarda amarela"
+linguica: "Linguiça defumada, pacote de linguiça"
+maizena_maizena: "Maizena, caixa azul de amido de milho"
+nissin_lamen: "Nissin Lámen, pacote de macarrão instantâneo"
+paladin_moutarde: "Paladin Moutarde, mostarda francesa em frasco"
+perdigao_fusilli_com_tiras_de_frango_per: "Perdigão Fusilli com Tiras de Frango, prato congelado"
+piraque_piraque_recheado_supreme_limao: "Piraquê Recheado Supreme Limão, pacote de biscoito recheado"
+red_bull: "Red Bull, lata de energético azul e prata"
+ruffles_ruffles: "Ruffles, pacote de batata chips ondulada"
+toddy: "Toddy, lata de achocolatado em pó"
+toupargel_6_crepes_roulees_jambon_emment: "Toupargel, embalagem de crepes recheados com presunto e queijo Emmental"
+uniliver_atole_chocolate: "Unilever Atolé Chocolate, bebida de chocolate quente instantâneo em pó"
