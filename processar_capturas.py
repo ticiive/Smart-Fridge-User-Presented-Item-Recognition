@@ -26,7 +26,6 @@ import csv
 import json
 import sys
 import time
-import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -38,6 +37,14 @@ import open_clip
 import torch
 import yaml
 from PIL import Image
+
+from ocr_rotulo import (
+    checar_vision,
+    construir_indice_palavras,
+    match_palavras,
+    normalizar,
+    ocr_imagem,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,17 +62,6 @@ RESULTADOS_DIR = Path("resultados")
 CAPTURAS_DIR   = Path("capturas")
 LOGS_DEMO_DIR  = Path("logs_demo")
 
-_STOP_WORDS = {
-    # pt
-    "de", "da", "do", "das", "dos", "com", "sem", "por", "para", "em",
-    "um", "uma", "uns", "umas", "que", "nao", "sim", "ate", "sua", "seu",
-    "van", "les", "des", "aux", "une",
-    # en
-    "the", "and", "for", "with", "from", "are", "has", "not", "per",
-    "san", "mix",
-}
-
-
 # ---------------------------------------------------------------------------
 # Utilitarios
 # ---------------------------------------------------------------------------
@@ -76,12 +72,6 @@ def get_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
-
-
-def normalizar(texto: str) -> str:
-    texto = texto.lower()
-    texto = unicodedata.normalize("NFD", texto)
-    return "".join(c for c in texto if unicodedata.category(c) != "Mn")
 
 
 def load_config(path: str) -> dict:
@@ -128,41 +118,6 @@ def gerar_palavras_yaml(nomes: list[str]) -> dict:
     return resultado
 
 
-def construir_indice_palavras(palavras: dict) -> dict:
-    """
-    Retorna {palavra_normalizada: nome_produto} apenas para palavras que:
-      - tenham >= 3 letras
-      - nao sejam stop-word
-      - aparecam em EXATAMENTE UM produto do catalogo
-
-    Imprime as palavras descartadas por serem compartilhadas entre produtos.
-    """
-    contagem: dict = {}
-    for nome, kws in palavras.items():
-        for kw in kws:
-            kn = normalizar(kw)
-            if len(kn) < 3 or kn in _STOP_WORDS:
-                continue
-            if kn not in contagem:
-                contagem[kn] = []
-            if nome not in contagem[kn]:
-                contagem[kn].append(nome)
-
-    indice: dict = {}
-    compartilhadas = []
-    for kw, prods in sorted(contagem.items()):
-        if len(prods) == 1:
-            indice[kw] = prods[0]
-        else:
-            compartilhadas.append(kw)
-
-    if compartilhadas:
-        print(f"  Palavras descartadas (compartilhadas entre produtos): "
-              f"{', '.join(compartilhadas)}")
-    print(f"  {len(indice)} palavra(s) unicas para matching OCR.")
-    return indice
-
-
 # ---------------------------------------------------------------------------
 # Opiniao 1 — CLIP B32
 # ---------------------------------------------------------------------------
@@ -187,74 +142,8 @@ def inferir_clip(
 
 
 # ---------------------------------------------------------------------------
-# Opiniao 2 — OCR Apple Vision
+# Opiniao 2 — OCR Apple Vision  (implementacao em ocr_rotulo.py)
 # ---------------------------------------------------------------------------
-
-_vision_ok: Optional[bool] = None
-
-
-def checar_vision() -> bool:
-    global _vision_ok
-    if _vision_ok is not None:
-        return _vision_ok
-    try:
-        import Vision          # noqa: F401
-        from Foundation import NSURL  # noqa: F401
-        _vision_ok = True
-    except ImportError:
-        print(
-            "AVISO: pyobjc-framework-Vision nao instalado — OCR desativado.\n"
-            "  Instale com: .venv/bin/pip install pyobjc-framework-Vision\n"
-            "  Ou todo o bundle:  .venv/bin/pip install pyobjc"
-        )
-        _vision_ok = False
-    return _vision_ok
-
-
-def ocr_imagem(img_path: Path) -> str:
-    try:
-        import Vision
-        from Foundation import NSURL
-
-        url     = NSURL.fileURLWithPath_(str(img_path.resolve()))
-        request = Vision.VNRecognizeTextRequest.alloc().init()
-        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-        request.setRecognitionLanguages_(["pt-BR", "en-US"])
-        request.setUsesLanguageCorrection_(True)
-
-        handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(url, {})
-        handler.performRequests_error_([request], None)
-
-        results = request.results()
-        if not results:
-            return ""
-        partes = []
-        for obs in results:
-            tops = obs.topCandidates_(1)
-            if tops:
-                partes.append(str(tops[0].string()))
-        return " ".join(partes)
-    except Exception as exc:
-        print(f"  [ocr] {img_path.name}: {exc}")
-        return ""
-
-
-def match_palavras(texto: str, indice: dict) -> str:
-    """
-    indice: {palavra_normalizada: nome_produto} — saida de construir_indice_palavras.
-    Conta votos de palavras unicas encontradas no texto OCR.
-    """
-    if not texto.strip() or not indice:
-        return "nenhum"
-    texto_norm = normalizar(texto)
-    votos: dict = {}
-    for kw, nome in indice.items():
-        if kw in texto_norm:
-            votos[nome] = votos.get(nome, 0) + 1
-    if not votos:
-        return "nenhum"
-    return max(votos, key=lambda n: votos[n])
-
 
 # ---------------------------------------------------------------------------
 # Opiniao 3 — VLM Ollama
@@ -457,15 +346,16 @@ def main():
     campos = [
         "arquivo",
         "clip_nome", "clip_sim", "clip_ms",
-        "ocr_texto", "ocr_nome", "ocr_ms",
+        "ocr_texto", "ocr_texto_bruto", "ocr_rotacao", "ocr_nome", "ocr_ms",
         "vlm_nome", "vlm_ms",
         "verdadeiro",
     ]
 
-    n_total      = 0
-    soma_clip_ms = 0.0
-    soma_ocr_ms  = 0.0
-    soma_vlm_ms  = 0.0
+    n_total         = 0
+    n_ocr_com_texto = 0
+    soma_clip_ms    = 0.0
+    soma_ocr_ms     = 0.0
+    soma_vlm_ms     = 0.0
 
     with open(csv_out, "w", newline="", encoding="utf-8") as f_csv:
         writer = csv.DictWriter(f_csv, fieldnames=campos)
@@ -482,11 +372,16 @@ def main():
             soma_clip_ms += clip_ms
 
             t0 = time.perf_counter()
-            ocr_texto = ocr_imagem(img_path) if usar_ocr else ""
+            if usar_ocr:
+                ocr_texto, ocr_texto_bruto, ocr_rotacao = ocr_imagem(img_path)
+            else:
+                ocr_texto, ocr_texto_bruto, ocr_rotacao = "", "", 0
             ocr_nome  = match_palavras(ocr_texto, indice_ocr)
-            ocr_ms        = (time.perf_counter() - t0) * 1000
+            ocr_ms    = (time.perf_counter() - t0) * 1000
             if usar_ocr:
                 soma_ocr_ms += ocr_ms
+                if ocr_texto_bruto:
+                    n_ocr_com_texto += 1
 
             t0 = time.perf_counter()
             vlm_nome  = inferir_vlm(img_path, nomes) if usar_vlm else ""
@@ -502,16 +397,18 @@ def main():
             )
 
             writer.writerow({
-                "arquivo":    str(img_path),
-                "clip_nome":  clip_nome,
-                "clip_sim":   f"{clip_sim:.4f}",
-                "clip_ms":    f"{clip_ms:.1f}",
-                "ocr_texto":  ocr_texto,
-                "ocr_nome":   ocr_nome,
-                "ocr_ms":     f"{ocr_ms:.1f}",
-                "vlm_nome":   vlm_nome,
-                "vlm_ms":     f"{vlm_ms:.1f}",
-                "verdadeiro": "",
+                "arquivo":         str(img_path),
+                "clip_nome":       clip_nome,
+                "clip_sim":        f"{clip_sim:.4f}",
+                "clip_ms":         f"{clip_ms:.1f}",
+                "ocr_texto":       ocr_texto,
+                "ocr_texto_bruto": ocr_texto_bruto,
+                "ocr_rotacao":     ocr_rotacao,
+                "ocr_nome":        ocr_nome,
+                "ocr_ms":          f"{ocr_ms:.1f}",
+                "vlm_nome":        vlm_nome,
+                "vlm_ms":          f"{vlm_ms:.1f}",
+                "verdadeiro":      "",
             })
 
     print(f"\nResultados: {csv_out}")
@@ -520,7 +417,10 @@ def main():
     if n_total:
         print(f"  CLIP  : {n_total} classificacoes  |  media {soma_clip_ms / n_total:.1f} ms/img")
         if usar_ocr:
-            print(f"  OCR   : {n_total} classificacoes  |  media {soma_ocr_ms / n_total:.1f} ms/img")
+            taxa = f"{100 * n_ocr_com_texto // n_total}%" if n_total else "0%"
+            print(f"  OCR   : {n_total} classificacoes  |  "
+                  f"{n_ocr_com_texto} com texto ({taxa})  |  "
+                  f"media {soma_ocr_ms / n_total:.1f} ms/img")
         else:
             print("  OCR   : desativado (pyobjc-framework-Vision nao instalado)")
         if usar_vlm:

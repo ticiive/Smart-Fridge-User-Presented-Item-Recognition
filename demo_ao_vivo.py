@@ -61,6 +61,8 @@ import torch
 import yaml
 from PIL import Image
 
+from ocr_rotulo import checar_vision, construir_indice_palavras, match_palavras, ocr_imagem
+
 
 # ---------------------------------------------------------------------------
 # Constantes — ajuste aqui sem mexer no resto
@@ -104,6 +106,9 @@ YOLO_CLASSES_FRUTA = [
 YOLO_CONF_FRUTA     = 0.50   # limiar de confianca para aceitar fruta/hortifruti
 YOLO_IOU_FRUTA_EMB  = 0.30   # IoU maximo entre caixa de fruta e caixa de embalagem
 YOLO_MAX_AREA_FRUTA = 0.10   # fruta na mao e pequena; descarta se > 10% do frame
+
+# Filtro de novidade (YOLO)
+NOVIDADE_MIN      = 0.15   # fracao minima de pixels novos na caixa para aceitar deteccao
 YOLO_FRUTA_PT = {
     "banana":     "banana",
     "apple":      "maca",
@@ -160,6 +165,10 @@ MODELO_CLIP = "ViT-B-32"
 PRETRAINED  = "laion2b_s34b_b79k"
 
 EXTENSOES_SUPORTADAS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+# OCR ao fechar passagem
+PALAVRAS_YAML    = Path("catalogo_palavras.yaml")
+OCR_MAX_RECORTES = 6   # maximo de recortes salvos por passagem, ordenados por nitidez
 
 COR_VERDE    = (80, 200, 80)
 COR_VERMELHO = (60, 60, 220)
@@ -400,6 +409,10 @@ def detectar_produto_yolo(
             if bx2 <= bx1 or by2 <= by1:
                 return 0.0
             return float(msk[by1:by2, bx1:bx2].mean()) / 255.0
+        # Descarta deteccoes com novidade insuficiente (objeto ja estava na cena)
+        produtos = [d for d in produtos if _nov(d) >= NOVIDADE_MIN]
+        if not produtos:
+            return None
         # novidade DESC, confianca DESC, area ASC (menor embalagem preferida em empate)
         produtos.sort(
             key=lambda d: (_nov(d), d[4], -((d[2] - d[0]) * (d[3] - d[1]))),
@@ -1185,6 +1198,15 @@ def main():
 
     print(f"Pronto — {len(nomes)} produto(s) carregado(s).\n")
 
+    # ---- Indice OCR ----
+    indice_ocr: dict = {}
+    if PALAVRAS_YAML.exists():
+        with open(PALAVRAS_YAML, encoding="utf-8") as _f:
+            _palavras_ocr = yaml.safe_load(_f) or {}
+        print("Construindo indice OCR...")
+        indice_ocr = construir_indice_palavras(_palavras_ocr)
+        print()
+
     # ---- Detector de localizacao ----
     detector   = args.detector
     yolo_model = None
@@ -1353,6 +1375,9 @@ def main():
     # ---- estado do VLM em fila ----
     vlm_pendentes: int = 0
 
+    # ---- metodo que decidiu a ultima passagem (para HUD) ----
+    ultima_decisao_metodo: str = ""
+
     # ---- relatorio de sessao ----
     relatorio_passagens:   list = []  # passagens salvas
     relatorio_descartadas: list = []  # (duracao_fr, motivo)
@@ -1398,6 +1423,17 @@ def main():
         h, w = frame.shape[:2]
         if caixa_manual is None:
             caixa_manual = caixa_central(h, w)
+
+        # Auto-fundo: captura cena vazia no frame 15 se B nao foi pressionado
+        # (contador_frames ainda nao foi incrementado neste ponto, entao == 14 e o 15o frame)
+        if contador_frames == 14 and fundo_ref is None:
+            fundo_ref       = capturar_fundo(frame)
+            caixa_suavizada = None
+            (trilha_centroides, trilha_areas,
+             trilha_melhor_nome, trilha_melhor_sim,
+             trilha_frames_sem_det, trilha_cruzou) = _trilha_nova()
+            trilha_melhor_via = ""
+            print("Fundo capturado automaticamente (frame 15).")
 
         # ---- Determinar caixa e modo ----
         diag_yolo = {}
@@ -1580,6 +1616,9 @@ def main():
                         )
                         relatorio_cortadas += 1
 
+                    vencedor = ""
+                    dados    = {"n": 0, "soma": 0.0, "best": 0.0}
+
                     if not passagem_acertos:
                         log_f.write(
                             f"  PASSAGEM_SEM_REC  dur={passagem_frames_total}fr"
@@ -1614,32 +1653,16 @@ def main():
                             )
                         else:
                             _decisao_pass = "OK"
-                            feedback_texto, feedback_cor = _processar_evento(
-                                "entrada", vencedor, dados["best"],
-                                inventario, eventos, modo_evento="reconhecimento",
-                                origem=produto_via.get(vencedor, "clip"),
-                            )
-                            _recorte_ev = frame[qy1:qy2, qx1:qx2]
-                            if _recorte_ev.size > 0:
-                                n_log_evento += 1
-                                _salvar_crop_log(_recorte_ev, sessao_crops_dir,
-                                                 "evento", n_log_evento, vencedor)
-                            feedback_ate = time.time() + FEEDBACK_DURACAO
                             log_f.write(
                                 f"  PASSAGEM_OK  dur={passagem_frames_total}fr"
                                 f"  inf={passagem_inf_total}  aceit={len(passagem_acertos)}"
                                 f"  [{cnts_str}]  -> {vencedor}\n"
                             )
 
-                    # Selecionar melhor recorte e salvar (ou descartar)
-                    _n_clip_inf = sum(
-                        1 for fd in passagem_frames_dados if fd["clip_sim"] is not None
-                    )
+                    # Salvar ate OCR_MAX_RECORTES recortes ordenados por nitidez
                     _descartar_motivo = None
                     if passagem_frames_total < PASSAGEM_MIN_FRAMES:
                         _descartar_motivo = "muito_curta"
-                    elif _n_clip_inf == 0:
-                        _descartar_motivo = "sem_clip"
                     elif not passagem_frames_dados:
                         _descartar_motivo = "sem_produto"
 
@@ -1652,92 +1675,138 @@ def main():
                             (passagem_frames_total, _descartar_motivo)
                         )
                     else:
-                        _com_clip = [fd for fd in passagem_frames_dados
-                                     if fd["clip_sim"] is not None]
-                        if _com_clip:
-                            _melhor_fd = max(
-                                _com_clip, key=lambda fd: (fd["clip_sim"], fd["sharp"])
-                            )
-                            _criterio = "clip"
-                        else:
-                            _prod_fds = [
-                                fd for fd in passagem_frames_dados
-                                if fd["yolo_classe"]
-                                and fd["yolo_classe"] not in YOLO_DESCARTAR
-                            ]
-                            if _prod_fds:
-                                _melhor_fd = max(
-                                    _prod_fds,
-                                    key=lambda fd: (fd["yolo_conf"], fd["sharp"]),
-                                )
-                                _criterio = "yolo"
-                            elif passagem_frames_dados:
-                                _melhor_fd = max(
-                                    passagem_frames_dados, key=lambda fd: fd["sharp"]
-                                )
-                                _criterio = "nitidez"
-                            else:
-                                _melhor_fd = None
-                                _criterio  = "nenhum"
+                        _sorted_fds = sorted(
+                            passagem_frames_dados,
+                            key=lambda fd: fd["sharp"],
+                            reverse=True,
+                        )[:OCR_MAX_RECORTES]
+                        passagem_num += 1
+                        _crop_paths: list = []
+                        for _i_fd, _fd in enumerate(_sorted_fds):
+                            _letra = chr(ord("a") + _i_fd)
+                            _cp = capturas_dir / f"passagem_{passagem_num:03d}_{_letra}.jpg"
+                            cv2.imwrite(str(_cp), _fd["crop"])
+                            _crop_paths.append(_cp)
 
-                        if _melhor_fd is not None:
-                            passagem_num += 1
-                            _crop_path = capturas_dir / f"passagem_{passagem_num:03d}.jpg"
-                            cv2.imwrite(str(_crop_path), _melhor_fd["crop"])
-                            _sim_recorte = (
-                                _melhor_fd["clip_sim"]
-                                if _melhor_fd["clip_sim"] is not None
-                                else 0.0
+                        # OCR nos recortes do mais nitido para o menos nitido
+                        _ocr_match = "nenhum"
+                        _ocr_texto = ""
+                        _ocr_rot   = 0
+                        if _crop_paths and indice_ocr:
+                            for _cp_ocr in _crop_paths:
+                                _t, _t_b, _r = ocr_imagem(_cp_ocr)
+                                _m = match_palavras(_t, indice_ocr)
+                                if _m != "nenhum":
+                                    _ocr_match = _m
+                                    _ocr_texto = _t_b
+                                    _ocr_rot   = _r
+                                    break
+
+                        # Decisao: OCR > CLIP > VLM
+                        _metodo_decidiu = "ninguem"
+                        if _ocr_match != "nenhum":
+                            _metodo_decidiu = "ocr"
+                            feedback_texto, feedback_cor = _processar_evento(
+                                "entrada", _ocr_match, 1.0,
+                                inventario, eventos, modo_evento="reconhecimento",
+                                origem="ocr",
                             )
-                            _crop_path.with_suffix(".json").write_text(
-                                json.dumps({
-                                    "horario":          datetime.now().isoformat(
-                                        timespec="seconds"
-                                    ),
-                                    "duracao_fr":       passagem_frames_total,
-                                    "n_inferencias":    passagem_inf_total,
-                                    "decisao":          _decisao_pass,
-                                    "clip_vencedor":    _clip_opiniao,
-                                    "sim_clip_recorte": round(_sim_recorte, 4),
-                                    "classe_yolo":      _melhor_fd["yolo_classe"],
-                                    "conf_yolo":        round(_melhor_fd["yolo_conf"], 4),
-                                    "criterio_escolha": _criterio,
-                                }, ensure_ascii=False, indent=2),
-                                encoding="utf-8",
+                            _recorte_ev = _sorted_fds[0]["crop"]
+                            if _recorte_ev.size > 0:
+                                n_log_evento += 1
+                                _salvar_crop_log(_recorte_ev, sessao_crops_dir,
+                                                 "evento", n_log_evento, _ocr_match)
+                            feedback_ate = time.time() + FEEDBACK_DURACAO
+                            ultima_decisao_metodo = "OCR"
+                            log_f.write(
+                                f"  PASSAGEM_OCR  produto={_ocr_match}"
+                                f"  texto='{_ocr_texto[:40]}'  rot={_ocr_rot}\n"
                             )
-                            _quem_decidiu_init = (
-                                "clip" if _decisao_pass == "OK"
-                                else None if (usar_vlm and _decisao_pass == "SEM_REC")
-                                else "ninguem"
+                        elif _decisao_pass == "OK":
+                            _metodo_decidiu = "clip"
+                            feedback_texto, feedback_cor = _processar_evento(
+                                "entrada", vencedor, dados["best"],
+                                inventario, eventos, modo_evento="reconhecimento",
+                                origem=produto_via.get(vencedor, "clip"),
                             )
-                            relatorio_passagens.append({
-                                "num":           passagem_num,
-                                "horario":       datetime.now().isoformat(
+                            _recorte_ev = frame[qy1:qy2, qx1:qx2]
+                            if _recorte_ev.size > 0:
+                                n_log_evento += 1
+                                _salvar_crop_log(_recorte_ev, sessao_crops_dir,
+                                                 "evento", n_log_evento, vencedor)
+                            feedback_ate = time.time() + FEEDBACK_DURACAO
+                            ultima_decisao_metodo = "CLIP"
+
+                        # quem_decidiu inicial para o relatorio
+                        _quem_decidiu_init = (
+                            _metodo_decidiu if _metodo_decidiu != "ninguem"
+                            else None if (
+                                usar_vlm
+                                and _decisao_pass == "SEM_REC"
+                                and _ocr_match == "nenhum"
+                            )
+                            else "ninguem"
+                        )
+
+                        # Salvar JSON de metadados
+                        _sim_best = (
+                            _sorted_fds[0]["clip_sim"]
+                            if _sorted_fds and _sorted_fds[0]["clip_sim"] is not None
+                            else 0.0
+                        )
+                        (capturas_dir / f"passagem_{passagem_num:03d}.json").write_text(
+                            json.dumps({
+                                "horario":         datetime.now().isoformat(
                                     timespec="seconds"
                                 ),
-                                "duracao_fr":    passagem_frames_total,
-                                "n_inferencias": passagem_inf_total,
-                                "decisao_clip":  _decisao_pass,
-                                "clip_vencedor": _clip_opiniao,
-                                "vlm_nome":      None,
-                                "vlm_duracao_s": None,
-                                "quem_decidiu":  _quem_decidiu_init,
-                            })
+                                "duracao_fr":      passagem_frames_total,
+                                "n_inferencias":   passagem_inf_total,
+                                "recortes":        [cp.name for cp in _crop_paths],
+                                "decisao_clip":    _decisao_pass,
+                                "clip_vencedor":   _clip_opiniao,
+                                "sim_clip_melhor": round(_sim_best, 4),
+                                "ocr_match":       _ocr_match,
+                                "ocr_texto":       _ocr_texto[:80],
+                                "ocr_rotacao":     _ocr_rot,
+                                "metodo_decidiu":  _quem_decidiu_init or "pendente",
+                            }, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
 
-                            if usar_vlm and _decisao_pass == "SEM_REC":
-                                vlm_fila_pedidos.put({
-                                    "passagem_num": passagem_num,
-                                    "crop":         _melhor_fd["crop"].copy(),
-                                    "clip_opiniao": _clip_opiniao,
-                                    "nomes":        list(nomes),
-                                    "dados_evento": {
-                                        "clip":    _clip_opiniao,
-                                        "sim":     _sim_clip,
-                                        "origem":  "clip",
-                                        "decisao": _decisao_pass,
-                                    },
-                                })
-                                vlm_pendentes += 1
+                        relatorio_passagens.append({
+                            "num":           passagem_num,
+                            "horario":       datetime.now().isoformat(
+                                timespec="seconds"
+                            ),
+                            "duracao_fr":    passagem_frames_total,
+                            "n_inferencias": passagem_inf_total,
+                            "decisao_clip":  _decisao_pass,
+                            "clip_vencedor": _clip_opiniao,
+                            "ocr_match":     _ocr_match,
+                            "ocr_texto":     _ocr_texto[:80],
+                            "ocr_rotacao":   _ocr_rot,
+                            "vlm_nome":      None,
+                            "vlm_duracao_s": None,
+                            "quem_decidiu":  _quem_decidiu_init,
+                        })
+
+                        # VLM: apenas se OCR nao decidiu e CLIP nao reconheceu
+                        if (usar_vlm
+                                and _decisao_pass == "SEM_REC"
+                                and _ocr_match == "nenhum"):
+                            vlm_fila_pedidos.put({
+                                "passagem_num": passagem_num,
+                                "crop":         _sorted_fds[0]["crop"].copy(),
+                                "clip_opiniao": _clip_opiniao,
+                                "nomes":        list(nomes),
+                                "dados_evento": {
+                                    "clip":    _clip_opiniao,
+                                    "sim":     _sim_clip,
+                                    "origem":  "clip",
+                                    "decisao": _decisao_pass,
+                                },
+                            })
+                            vlm_pendentes += 1
 
                     # Resetar estado da passagem
                     passagem_ativa          = False
@@ -1872,6 +1941,7 @@ def main():
                             _salvar_crop_log(_recorte_ev, sessao_crops_dir,
                                              "evento", n_log_evento, _vlm_nome)
                         feedback_ate = time.time() + FEEDBACK_DURACAO
+                        ultima_decisao_metodo = "VLM"
                     else:
                         if _rp is not None:
                             _rp["quem_decidiu"] = "ninguem"
@@ -1891,6 +1961,8 @@ def main():
                 reconhec_info = f"passagem: {lider}  {cnt} acertos"
             else:
                 reconhec_info = "passagem: aguardando..."
+        elif ultima_decisao_metodo:
+            reconhec_info = f"dec: {ultima_decisao_metodo}"
 
         # ---- Desenhar ----
         if direcao_ativa and modo_direcao == "linha":
@@ -2095,6 +2167,11 @@ def main():
             rf.write(
                 f"  decisao_clip:  {_p['decisao_clip']}  ({_p['clip_vencedor']})\n"
             )
+            _ocr_m = _p.get("ocr_match", "nenhum")
+            rf.write(f"  ocr_match:     {_ocr_m}\n")
+            if _ocr_m != "nenhum":
+                rf.write(f"  ocr_texto:     {_p.get('ocr_texto', '')[:60]}\n")
+                rf.write(f"  ocr_rotacao:   {_p.get('ocr_rotacao', 0)}\n")
             if _p["vlm_nome"] is not None:
                 rf.write(
                     f"  vlm:           {_p['vlm_nome']}  ({_p['vlm_duracao_s']:.1f}s)\n"
@@ -2104,6 +2181,19 @@ def main():
             rf.write(
                 f"  quem_decidiu:  {_p.get('quem_decidiu') or '(pendente)'}\n"
             )
+        # Resumo por metodo
+        _n_met: dict = {"ocr": 0, "clip": 0, "vlm": 0, "ninguem": 0, "pendente": 0}
+        for _p in relatorio_passagens:
+            _qd = _p.get("quem_decidiu")
+            if _qd is None:
+                _n_met["pendente"] += 1
+            else:
+                _n_met[_qd] = _n_met.get(_qd, 0) + 1
+        rf.write("-" * 60 + "\n")
+        rf.write("Resumo por metodo:\n")
+        for _met, _n in _n_met.items():
+            if _n:
+                rf.write(f"  {_met}: {_n}\n")
     print(f"Relatorio       : {rel_path}")
 
 
