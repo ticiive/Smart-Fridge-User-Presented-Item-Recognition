@@ -81,7 +81,7 @@ SUAVIZACAO_ALPHA  = 0.50
 
 # Detector YOLO-World — edite YOLO_CLASSES para ajustar vocabulario
 YOLO_MODELO        = "yolov8s-worldv2.pt"
-YOLO_CONF          = 0.05   # confianca baixa para nao perder embalagens pequenas
+YOLO_CONF          = 0.25   # limiar de confianca YOLO
 YOLO_IOU_PESSOA    = 0.50   # IoU maximo entre embalagem e corpo/mao para descartar
 YOLO_MAX_AREA_FRAC = 0.25   # fracao maxima do frame — descarta troncos e pessoas inteiras
 YOLO_CLASSES = [
@@ -98,8 +98,13 @@ YOLO_CLASSES = [
     "human face",
     "hand",
     "arm",
+    "clothing",
+    "shirt sleeve",
+    "fabric",
+    "human skin",
 ]
-YOLO_DESCARTAR = {"person", "human face", "hand", "arm"}
+YOLO_DESCARTAR = {"person", "human face", "hand", "arm",
+                  "clothing", "shirt sleeve", "fabric", "human skin"}
 
 # Hortifruti: detectado pelo rotulo do YOLO, sem passar pelo catalogo CLIP
 YOLO_CLASSES_FRUTA = [
@@ -142,6 +147,7 @@ OLLAMA_MODELO_VLM   = "qwen2.5vl:3b"
 OLLAMA_TIMEOUT_VLM  = 180  # segundos
 
 # Limiares da cascata de decisao (CLIP)
+CLIP_SIM_MIN_PASSAGEM = 0.50  # sim minima para abrir passagem e para nao descartar ao final
 CLIP_LIMIAR_ALTO  = 0.66   # decide diretamente (requer margem >= CLIP_MARGEM_ALTA)
 CLIP_LIMIAR_MEDIO = 0.55   # abaixo: rejeita; acima e abaixo de ALTO: encaminha ao VLM
 CLIP_MARGEM_ALTA  = 0.05   # margem minima para CLIP decidir diretamente
@@ -1482,6 +1488,7 @@ def main():
             print("Camera encerrou o stream.")
             break
 
+        frame_orig = frame.copy()
         h, w = frame.shape[:2]
         if caixa_manual is None:
             caixa_manual = caixa_central(h, w)
@@ -1627,15 +1634,23 @@ def main():
         if not direcao_ativa:
             det_valida = (modo == "auto")
 
-            # Iniciar passagem quando detector encontra produto
+            # Iniciar passagem: exige evidencia de produto via CLIP
             if det_valida and not passagem_ativa:
-                passagem_ativa          = True
-                passagem_frames_sem_det = 0
-                passagem_frames_total   = 0
-                passagem_inf_total      = 0
-                passagem_acertos        = []
-                passagem_frames_dados   = []
-                passagem_clip_best      = {"sim": 0.0, "prod": "", "marg": 0.0}
+                if (inferencia_rodou and via_ident == "catalogo"
+                        and similaridade_atual < CLIP_SIM_MIN_PASSAGEM):
+                    log_f.write(
+                        f"  DETECCAO_IGNORADA_SIM_BAIXA  sim={similaridade_atual:.3f}"
+                        f"  prod={melhor_palpite}\n"
+                    )
+                    modo = "sem_objeto"
+                else:
+                    passagem_ativa          = True
+                    passagem_frames_sem_det = 0
+                    passagem_frames_total   = 0
+                    passagem_inf_total      = 0
+                    passagem_acertos        = []
+                    passagem_frames_dados   = []
+                    passagem_clip_best      = {"sim": 0.0, "prod": "", "marg": 0.0}
 
             if passagem_ativa:
                 passagem_frames_total += 1
@@ -1739,12 +1754,20 @@ def main():
                         _descartar_motivo = "muito_curta"
                     elif not passagem_frames_dados:
                         _descartar_motivo = "sem_produto"
+                    elif passagem_clip_best["sim"] < CLIP_SIM_MIN_PASSAGEM:
+                        _descartar_motivo = "sim_baixa"
 
                     if _descartar_motivo:
-                        log_f.write(
-                            f"  PASSAGEM_DESCARTADA  dur={passagem_frames_total}fr"
-                            f"  motivo={_descartar_motivo}\n"
-                        )
+                        if _descartar_motivo == "sim_baixa":
+                            log_f.write(
+                                f"  PASSAGEM_SEM_PRODUTO  dur={passagem_frames_total}fr"
+                                f"  sim_max={passagem_clip_best['sim']:.3f}\n"
+                            )
+                        else:
+                            log_f.write(
+                                f"  PASSAGEM_DESCARTADA  dur={passagem_frames_total}fr"
+                                f"  motivo={_descartar_motivo}\n"
+                            )
                         relatorio_descartadas.append(
                             (passagem_frames_total, _descartar_motivo)
                         )
@@ -2352,7 +2375,7 @@ def main():
             salvar_enriquecido(frame[qy1:qy2, qx1:qx2].copy(), enriquecido_dir, sugestao)
 
         elif tecla == 32:   # ESPACO
-            salvar_recorte(frame[qy1:qy2, qx1:qx2].copy(), testes_dir)
+            salvar_recorte(frame_orig[qy1:qy2, qx1:qx2].copy(), testes_dir)
 
         elif tecla_raw in KEY_LEFT:
             if deteccao_ativa:

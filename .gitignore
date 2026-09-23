@@ -14,3 +14,5 @@ catalogo_rejeitado/
 .DS_Store
 ollama.log
 index/
+.claude/
+.claude/
