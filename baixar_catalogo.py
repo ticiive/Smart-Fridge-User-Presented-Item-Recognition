@@ -43,6 +43,17 @@ OFF_IMAGE_LICENSE = "Creative Commons Attribution-ShareAlike 3.0 (CC BY-SA 3.0)"
 OFF_LICENSE_URL = "https://creativecommons.org/licenses/by-sa/3.0/"
 
 
+def url_tamanho_cheio(url: str) -> Optional[str]:
+    """
+    O OFF serve imagens em vários tamanhos: front_pt.11.400.jpg (400 px) e
+    front_pt.11.full.jpg (resolução original).  Transforma a URL substituindo
+    o sufixo numérico de tamanho (.<N>.jpg) por .full.jpg.
+    Retorna None se o padrão não for encontrado (URL já é full ou outro formato).
+    """
+    novo = re.sub(r"\.\d+\.jpg$", ".full.jpg", url, flags=re.IGNORECASE)
+    return novo if novo != url else None
+
+
 # ---------------------------------------------------------------------------
 # Configuração e logging
 # ---------------------------------------------------------------------------
@@ -112,6 +123,33 @@ def download_image(url: str, session: requests.Session,
     except requests.RequestException as exc:
         logger.warning("Erro ao baixar imagem (%s): %s", url, exc)
         return None
+
+
+def download_image_maior(
+    url: str, session: requests.Session, logger: logging.Logger
+) -> tuple:
+    """
+    Tenta baixar a variante em tamanho cheio (.<N>.jpg → .full.jpg) antes da
+    versão redimensionada.  Cai para a URL original apenas em 404 ou erro de rede.
+    Retorna (bytes_ou_None, variante_str) onde variante_str é "full", "400px" ou "".
+    """
+    full_url = url_tamanho_cheio(url)
+    if full_url:
+        try:
+            resp = session.get(full_url, timeout=20)
+            if resp.status_code == 200:
+                logger.info("    variante: full  (%d KB)", len(resp.content) // 1024)
+                return resp.content, "full"
+            if resp.status_code != 404:
+                logger.warning("    full URL HTTP %d, tentando 400px", resp.status_code)
+        except requests.RequestException as exc:
+            logger.debug("    full URL falhou (%s), usando 400px", exc)
+
+    raw = download_image(url, session, logger)
+    if raw:
+        logger.info("    variante: 400px (%d KB)", len(raw) // 1024)
+        return raw, "400px"
+    return None, ""
 
 
 def check_image(raw: bytes, min_w: int, min_h: int,
@@ -236,7 +274,7 @@ def process(csv_path: Path, config: dict, logger: logging.Logger):
             continue
 
         logger.debug("  imagem: %s", image_url)
-        raw = download_image(image_url, session, logger)
+        raw, _variante = download_image_maior(image_url, session, logger)
         if raw is None:
             stats["erro"] += 1
             time.sleep(delay)
@@ -607,7 +645,7 @@ def process_lote(
             time.sleep(delay)
             continue
 
-        raw = download_image(image_url, session, logger)
+        raw, _variante = download_image_maior(image_url, session, logger)
         if raw is None:
             stats["erro"] += 1
             time.sleep(delay)

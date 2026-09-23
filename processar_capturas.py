@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import io
 import json
 import sys
 import time
@@ -55,10 +56,11 @@ MODELO_CLIP    = "ViT-B-32"
 PRETRAINED     = "laion2b_s34b_b79k"
 EXTENSOES      = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 PALAVRAS_YAML  = Path("catalogo_palavras.yaml")
-OLLAMA_URL     = "http://localhost:11434"
-OLLAMA_MODELO  = "qwen2.5vl:3b"
-OLLAMA_TIMEOUT = 30   # segundos por requisicao
-RESULTADOS_DIR = Path("resultados")
+OLLAMA_URL       = "http://localhost:11434"
+OLLAMA_MODELO    = "qwen2.5vl:3b"
+OLLAMA_TIMEOUT   = 180   # segundos por requisicao
+DESCRICOES_YAML  = Path("catalogo_descricoes.yaml")
+RESULTADOS_DIR   = Path("resultados")
 CAPTURAS_DIR   = Path("capturas")
 LOGS_DEMO_DIR  = Path("logs_demo")
 
@@ -175,20 +177,43 @@ def checar_ollama() -> bool:
     return _ollama_ok
 
 
-def inferir_vlm(img_path: Path, nomes: list[str]) -> str:
+def inferir_vlm(
+    img_path: Path,
+    nomes: list[str],
+    descricoes: dict,
+) -> tuple[str, str]:
+    """
+    Envia imagem ao Ollama (redimensionada para 896 px no lado maior).
+    Retorna (identificador_ou_nenhum, texto_lido_no_rotulo).
+    """
     try:
-        with open(img_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode()
+        img_pil = Image.open(img_path).convert("RGB")
+        w_rc, h_rc = img_pil.size
+        maior = max(w_rc, h_rc)
+        if maior > 896:
+            escala = 896 / maior
+            img_pil = img_pil.resize(
+                (max(1, int(w_rc * escala)), max(1, int(h_rc * escala))),
+                Image.LANCZOS,
+            )
+        buf = io.BytesIO()
+        img_pil.save(buf, format="JPEG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode()
 
-        lista  = "\n".join(f"- {n}" for n in nomes)
+        linhas_lista = "\n".join(
+            f"- {n}: {descricoes.get(n, n)}" for n in nomes
+        )
         prompt = (
-            "You are analyzing a food product image from a fridge camera.\n"
-            "Choose exactly one name from the catalog list below that matches "
-            "the product in the image.\n"
-            "If no product matches, respond: nenhum\n"
-            "Respond with ONLY the exact name from the list or 'nenhum'. "
-            "No explanation, no punctuation, nothing else.\n\n"
-            f"Catalog:\n{lista}"
+            "Você está analisando a imagem de um produto tirada por uma câmera de geladeira.\n"
+            "Leia todo o texto visível no rótulo e identifique o produto na lista abaixo.\n\n"
+            "Responda EXATAMENTE neste formato, em duas linhas:\n"
+            "TEXTO: <todo o texto que consegue ler no rótulo, ou vazio se nenhum>\n"
+            "PRODUTO: <identificador exato da lista, ou nenhum>\n\n"
+            "Regras:\n"
+            "- Use APENAS o identificador (palavra antes dos dois pontos em cada item).\n"
+            "- Se nenhum produto corresponder, responda PRODUTO: nenhum\n"
+            "- Não adicione explicações ou outras linhas.\n\n"
+            f"Lista de produtos:\n{linhas_lista}"
         )
         payload = json.dumps({
             "model":   OLLAMA_MODELO,
@@ -206,25 +231,31 @@ def inferir_vlm(img_path: Path, nomes: list[str]) -> str:
         with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
             data = json.loads(resp.read())
 
-        resposta   = data.get("response", "").strip().strip("\"'")
-        nomes_set  = set(nomes)
+        resposta_raw = data.get("response", "").strip()
+        texto_vlm    = ""
+        produto_vlm  = "nenhum"
+        for linha in resposta_raw.splitlines():
+            if linha.upper().startswith("TEXTO:"):
+                texto_vlm = linha[linha.index(":") + 1:].strip()
+            elif linha.upper().startswith("PRODUTO:"):
+                produto_vlm = linha[linha.index(":") + 1:].strip().strip("\"'")
 
-        if resposta.lower() == "nenhum":
-            return "nenhum"
-        if resposta in nomes_set:
-            return resposta
-        resp_lower = resposta.lower()
-        for n in nomes:
-            if n.lower() == resp_lower:
-                return n
-        return f"invalida:{resposta[:60]}"
+        nomes_set = set(nomes)
+        if produto_vlm.lower() == "nenhum":
+            produto_vlm = "nenhum"
+        elif produto_vlm not in nomes_set:
+            pv_lower = produto_vlm.lower()
+            match_n  = next((n for n in nomes if n.lower() == pv_lower), None)
+            produto_vlm = match_n if match_n else f"invalida:{produto_vlm[:60]}"
+
+        return produto_vlm, texto_vlm
 
     except urllib.error.URLError as exc:
         print(f"  [vlm] conexao perdida: {exc}")
-        return ""
+        return "", ""
     except Exception as exc:
         print(f"  [vlm] {img_path.name}: {exc}")
-        return ""
+        return "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +366,12 @@ def main():
         )
     print(f"\n{len(imagens)} recorte(s) para processar.\n")
 
+    descricoes_vlm: dict = {}
+    if DESCRICOES_YAML.exists():
+        with open(DESCRICOES_YAML, encoding="utf-8") as _f:
+            descricoes_vlm = yaml.safe_load(_f) or {}
+        print(f"Descricoes VLM : {DESCRICOES_YAML}  ({len(descricoes_vlm)} entradas)")
+
     usar_ocr = checar_vision()
     usar_vlm = checar_ollama()
     print()
@@ -347,7 +384,7 @@ def main():
         "arquivo",
         "clip_nome", "clip_sim", "clip_ms",
         "ocr_texto", "ocr_texto_bruto", "ocr_rotacao", "ocr_nome", "ocr_ms",
-        "vlm_nome", "vlm_ms",
+        "vlm_nome", "vlm_texto", "vlm_ms",
         "verdadeiro",
     ]
 
@@ -384,7 +421,10 @@ def main():
                     n_ocr_com_texto += 1
 
             t0 = time.perf_counter()
-            vlm_nome  = inferir_vlm(img_path, nomes) if usar_vlm else ""
+            if usar_vlm:
+                vlm_nome, vlm_texto = inferir_vlm(img_path, nomes, descricoes_vlm)
+            else:
+                vlm_nome, vlm_texto = "", ""
             vlm_ms        = (time.perf_counter() - t0) * 1000
             if usar_vlm:
                 soma_vlm_ms += vlm_ms
@@ -407,6 +447,7 @@ def main():
                 "ocr_nome":        ocr_nome,
                 "ocr_ms":          f"{ocr_ms:.1f}",
                 "vlm_nome":        vlm_nome,
+                "vlm_texto":       vlm_texto,
                 "vlm_ms":          f"{vlm_ms:.1f}",
                 "verdadeiro":      "",
             })

@@ -76,17 +76,27 @@ def match_palavras(texto: str, indice: dict) -> str:
     """
     indice: {palavra_normalizada: nome_produto} — saida de construir_indice_palavras.
     Conta votos de palavras unicas encontradas no texto OCR.
+    So decide se ha pelo menos uma palavra-chave com >= 5 caracteres
+    ou pelo menos duas palavras-chave distintas votando no vencedor.
     """
     if not texto.strip() or not indice:
         return "nenhum"
     texto_norm = normalizar(texto)
-    votos: dict = {}
+    votos:        dict = {}
+    kws_por_prod: dict = {}
     for kw, nome in indice.items():
         if kw in texto_norm:
             votos[nome] = votos.get(nome, 0) + 1
+            kws_por_prod.setdefault(nome, []).append(kw)
     if not votos:
         return "nenhum"
-    return max(votos, key=lambda n: votos[n])
+    vencedor   = max(votos, key=lambda n: votos[n])
+    kws_ganhas = kws_por_prod.get(vencedor, [])
+    tem_longa  = any(len(kw) >= 5 for kw in kws_ganhas)
+    tem_dois   = votos[vencedor] >= 2
+    if not tem_longa and not tem_dois:
+        return "nenhum"
+    return vencedor
 
 
 # ---------------------------------------------------------------------------

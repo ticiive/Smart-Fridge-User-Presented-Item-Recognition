@@ -136,7 +136,15 @@ MARGEM_MINIMA           = 0.02 # diferenca minima entre 1o e 2o do catalogo para
 # VLM local (--vlm)
 OLLAMA_URL          = "http://localhost:11434"
 OLLAMA_MODELO_VLM   = "qwen2.5vl:3b"
-OLLAMA_TIMEOUT_VLM  = 60   # segundos
+OLLAMA_TIMEOUT_VLM  = 180  # segundos
+
+# Limiares da cascata de decisao (CLIP)
+CLIP_LIMIAR_ALTO  = 0.66   # decide diretamente (requer margem >= CLIP_MARGEM_ALTA)
+CLIP_LIMIAR_MEDIO = 0.55   # abaixo: rejeita; acima e abaixo de ALTO: encaminha ao VLM
+CLIP_MARGEM_ALTA  = 0.05   # margem minima para CLIP decidir diretamente
+
+# Descricoes em portugues para o prompt do VLM
+DESCRICOES_YAML = Path("catalogo_descricoes.yaml")
 
 # Trilha (--direcao area|linha)
 TRILHA_FRAMES_TIMEOUT = 10
@@ -937,12 +945,19 @@ def listar_cameras():
 # VLM local (Ollama) — usado com --vlm
 # ---------------------------------------------------------------------------
 
-def _chamar_ollama_vlm(recorte_bgr: np.ndarray, nomes: list) -> str:
-    """Envia recorte BGR ao Ollama e devolve nome exato da lista ou 'nenhum'."""
+def _chamar_ollama_vlm(
+    recorte_bgr: np.ndarray,
+    nomes: list,
+    descricoes: dict,
+) -> tuple[str, str]:
+    """
+    Envia recorte BGR ao Ollama (redimensionado para 896 px no lado maior).
+    Retorna (identificador_ou_nenhum, texto_lido_no_rotulo).
+    """
     h_rc, w_rc = recorte_bgr.shape[:2]
     maior = max(h_rc, w_rc)
-    if maior > 448:
-        escala = 448 / maior
+    if maior > 896:
+        escala = 896 / maior
         recorte_bgr = cv2.resize(
             recorte_bgr,
             (max(1, int(w_rc * escala)), max(1, int(h_rc * escala))),
@@ -950,15 +965,20 @@ def _chamar_ollama_vlm(recorte_bgr: np.ndarray, nomes: list) -> str:
         )
     _, buf   = cv2.imencode(".jpg", recorte_bgr)
     img_b64  = base64.b64encode(buf.tobytes()).decode()
-    lista    = "\n".join(f"- {n}" for n in nomes)
-    prompt   = (
-        "You are analyzing a food product image from a fridge camera.\n"
-        "Choose exactly one name from the catalog list below that matches "
-        "the product in the image.\n"
-        "If none match, respond: nenhum\n"
-        "Respond with ONLY the exact name or 'nenhum'. "
-        "No explanation, no punctuation, nothing else.\n\n"
-        f"Catalog:\n{lista}"
+    linhas_lista = "\n".join(
+        f"- {n}: {descricoes.get(n, n)}" for n in nomes
+    )
+    prompt = (
+        "Você está analisando a imagem de um produto tirada por uma câmera de geladeira.\n"
+        "Leia todo o texto visível no rótulo e identifique o produto na lista abaixo.\n\n"
+        "Responda EXATAMENTE neste formato, em duas linhas:\n"
+        "TEXTO: <todo o texto que consegue ler no rótulo, ou vazio se nenhum>\n"
+        "PRODUTO: <identificador exato da lista, ou nenhum>\n\n"
+        "Regras:\n"
+        "- Use APENAS o identificador (palavra antes dos dois pontos em cada item).\n"
+        "- Se nenhum produto corresponder, responda PRODUTO: nenhum\n"
+        "- Não adicione explicações ou outras linhas.\n\n"
+        f"Lista de produtos:\n{linhas_lista}"
     )
     payload = json.dumps({
         "model":   OLLAMA_MODELO_VLM,
@@ -974,17 +994,22 @@ def _chamar_ollama_vlm(recorte_bgr: np.ndarray, nomes: list) -> str:
     )
     with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT_VLM) as resp:
         data = json.loads(resp.read())
-    resposta  = data.get("response", "").strip().strip("\"'")
+    resposta_raw = data.get("response", "").strip()
+    texto_vlm    = ""
+    produto_vlm  = "nenhum"
+    for linha in resposta_raw.splitlines():
+        if linha.upper().startswith("TEXTO:"):
+            texto_vlm = linha[linha.index(":") + 1:].strip()
+        elif linha.upper().startswith("PRODUTO:"):
+            produto_vlm = linha[linha.index(":") + 1:].strip().strip("\"'")
     nomes_set = set(nomes)
-    if resposta.lower() == "nenhum":
-        return "nenhum"
-    if resposta in nomes_set:
-        return resposta
-    resp_lower = resposta.lower()
-    for n in nomes:
-        if n.lower() == resp_lower:
-            return n
-    return f"invalida:{resposta[:40]}"
+    if produto_vlm.lower() == "nenhum":
+        produto_vlm = "nenhum"
+    elif produto_vlm not in nomes_set:
+        pv_lower = produto_vlm.lower()
+        match_n  = next((n for n in nomes if n.lower() == pv_lower), None)
+        produto_vlm = match_n if match_n else f"invalida:{produto_vlm[:40]}"
+    return produto_vlm, texto_vlm
 
 
 def _worker_vlm(
@@ -998,17 +1023,22 @@ def _worker_vlm(
             break
         t0 = time.time()
         try:
-            vlm = _chamar_ollama_vlm(pedido["crop"], pedido["nomes"])
+            vlm_prod, vlm_texto = _chamar_ollama_vlm(
+                pedido["crop"], pedido["nomes"], pedido["descricoes"]
+            )
         except Exception as exc:
             print(f"\n  [vlm] erro: {exc}")
-            vlm = ""
+            vlm_prod, vlm_texto = "", ""
         dur = time.time() - t0
         fila_respostas.put({
             "passagem_num": pedido["passagem_num"],
-            "vlm":          vlm,
+            "vlm":          vlm_prod,
+            "vlm_texto":    vlm_texto,
             "clip":         pedido["clip_opiniao"],
+            "ocr":          pedido.get("ocr_opiniao", "nenhum"),
             "dados_evento": pedido["dados_evento"],
             "vlm_duracao":  dur,
+            "vlm_motivo":   pedido.get("vlm_motivo", ""),
         })
         fila_pedidos.task_done()
 
@@ -1207,6 +1237,13 @@ def main():
         indice_ocr = construir_indice_palavras(_palavras_ocr)
         print()
 
+    # ---- Descricoes VLM ----
+    descricoes_vlm: dict = {}
+    if DESCRICOES_YAML.exists():
+        with open(DESCRICOES_YAML, encoding="utf-8") as _f:
+            descricoes_vlm = yaml.safe_load(_f) or {}
+        print(f"Descricoes VLM   : {DESCRICOES_YAML}  ({len(descricoes_vlm)} entradas)")
+
     # ---- Detector de localizacao ----
     detector   = args.detector
     yolo_model = None
@@ -1243,7 +1280,7 @@ def main():
             )
             print("  Ollama disponivel. Aquecendo modelo...")
             _dummy = np.zeros((8, 8, 3), dtype=np.uint8)
-            _chamar_ollama_vlm(_dummy, nomes[:3])
+            _chamar_ollama_vlm(_dummy, nomes[:3], {})
             print("  VLM pronto.")
         except Exception as exc:
             print(f"  AVISO: Ollama nao encontrado ({exc}) — --vlm desativado.")
@@ -1377,6 +1414,13 @@ def main():
 
     # ---- metodo que decidiu a ultima passagem (para HUD) ----
     ultima_decisao_metodo: str = ""
+
+    # ---- melhor resultado CLIP ao longo da passagem (para cascata) ----
+    passagem_clip_best: dict = {"sim": 0.0, "prod": "", "marg": 0.0}
+
+    # ---- ultimo OCR da passagem (para log e HUD) ----
+    ultimo_ocr_texto:   str = ""
+    ultimo_ocr_rotacao: int = 0
 
     # ---- relatorio de sessao ----
     relatorio_passagens:   list = []  # passagens salvas
@@ -1525,8 +1569,15 @@ def main():
                     else:
                         decisao_atual = "aceito"
                         nome_atual    = melhor_palpite
-                    via_ident          = "catalogo"
-                    inferencia_rodou   = True
+                    via_ident        = "catalogo"
+                    inferencia_rodou = True
+                    # Rastreia melhor CLIP da passagem (independente do limiar)
+                    if similaridade_atual > passagem_clip_best["sim"]:
+                        passagem_clip_best = {
+                            "sim":  similaridade_atual,
+                            "prod": melhor_palpite,
+                            "marg": margem_atual,
+                        }
 
         # ---- Contadores de sessao + crops de ambiguo ----
         if inferencia_rodou:
@@ -1566,6 +1617,7 @@ def main():
                 passagem_inf_total      = 0
                 passagem_acertos        = []
                 passagem_frames_dados   = []
+                passagem_clip_best      = {"sim": 0.0, "prod": "", "marg": 0.0}
 
             if passagem_ativa:
                 passagem_frames_total += 1
@@ -1628,11 +1680,15 @@ def main():
                         por_prod: dict = {}
                         for prod, sim, marg in passagem_acertos:
                             if prod not in por_prod:
-                                por_prod[prod] = {"soma": 0.0, "n": 0, "best": 0.0}
+                                por_prod[prod] = {
+                                    "soma": 0.0, "n": 0,
+                                    "best": 0.0, "best_marg": 0.0,
+                                }
                             por_prod[prod]["soma"] += sim
                             por_prod[prod]["n"]    += 1
                             if sim > por_prod[prod]["best"]:
-                                por_prod[prod]["best"] = sim
+                                por_prod[prod]["best"]      = sim
+                                por_prod[prod]["best_marg"] = marg
 
                         vencedor, dados = max(
                             por_prod.items(), key=lambda kv: kv[1]["soma"]
@@ -1695,16 +1751,75 @@ def main():
                         if _crop_paths and indice_ocr:
                             for _cp_ocr in _crop_paths:
                                 _t, _t_b, _r = ocr_imagem(_cp_ocr)
+                                if _t:
+                                    _ocr_texto = _t_b
+                                    _ocr_rot   = _r
                                 _m = match_palavras(_t, indice_ocr)
                                 if _m != "nenhum":
                                     _ocr_match = _m
                                     _ocr_texto = _t_b
                                     _ocr_rot   = _r
                                     break
+                        # Persiste OCR para HUD e relatorio
+                        if _ocr_texto:
+                            ultimo_ocr_texto   = _ocr_texto
+                            ultimo_ocr_rotacao = _ocr_rot
+                        log_f.write(
+                            f"  PASSAGEM_OCR_TEXTO  texto='{_ocr_texto[:60]}'"
+                            f"  rot={_ocr_rot}  match={_ocr_match}\n"
+                        )
 
-                        # Decisao: OCR > CLIP > VLM
-                        _metodo_decidiu = "ninguem"
-                        if _ocr_match != "nenhum":
+                        # --- Cascade: cascata de decisao ---
+                        # 1) Calcular capacidade do CLIP com limiares estritos
+                        _clip_pode_decidir = (
+                            _decisao_pass == "OK"
+                            and dados.get("best", 0.0) >= CLIP_LIMIAR_ALTO
+                            and dados.get("best_marg", 0.0) >= CLIP_MARGEM_ALTA
+                        )
+                        _clip_medio = (
+                            not _clip_pode_decidir
+                            and passagem_clip_best["sim"] >= CLIP_LIMIAR_MEDIO
+                        )
+
+                        _metodo_decidiu  = "ninguem"
+                        _vlm_enfileirado = False
+                        _vlm_motivo      = ""
+
+                        # 2) Discordancia OCR vs CLIP
+                        _discordancia = (
+                            _ocr_match != "nenhum"
+                            and _clip_pode_decidir
+                            and vencedor != _ocr_match
+                        )
+                        if _discordancia:
+                            log_f.write(
+                                f"  PASSAGEM_DISCORDANCIA  ocr={_ocr_match}"
+                                f"  clip={vencedor}  sim={dados['best']:.3f}"
+                                f"  -> VLM desempate\n"
+                            )
+                            _vlm_motivo = "desempate"
+                            if usar_vlm:
+                                vlm_fila_pedidos.put({
+                                    "passagem_num": passagem_num,
+                                    "crop":         _sorted_fds[0]["crop"].copy(),
+                                    "clip_opiniao": _clip_opiniao,
+                                    "ocr_opiniao":  _ocr_match,
+                                    "nomes":        list(nomes),
+                                    "descricoes":   descricoes_vlm,
+                                    "vlm_motivo":   "desempate",
+                                    "dados_evento": {
+                                        "clip":    _clip_opiniao,
+                                        "ocr":     _ocr_match,
+                                        "sim":     dados["best"],
+                                        "origem":  "vlm_desempate",
+                                        "decisao": "discordancia",
+                                    },
+                                })
+                                vlm_pendentes   += 1
+                                _vlm_enfileirado = True
+
+                        # 3) OCR decide (sem discordancia)
+                        elif _ocr_match != "nenhum":
                             _metodo_decidiu = "ocr"
                             feedback_texto, feedback_cor = _processar_evento(
                                 "entrada", _ocr_match, 1.0,
@@ -1719,10 +1834,12 @@ def main():
                             feedback_ate = time.time() + FEEDBACK_DURACAO
                             ultima_decisao_metodo = "OCR"
                             log_f.write(
-                                f"  PASSAGEM_OCR  produto={_ocr_match}"
+                                f"  PASSAGEM_OCR_DECIDE  produto={_ocr_match}"
                                 f"  texto='{_ocr_texto[:40]}'  rot={_ocr_rot}\n"
                             )
-                        elif _decisao_pass == "OK":
+
+                        # 4) CLIP decide (sim >= 0.66 e margem >= 0.05)
+                        elif _clip_pode_decidir:
                             _metodo_decidiu = "clip"
                             feedback_texto, feedback_cor = _processar_evento(
                                 "entrada", vencedor, dados["best"],
@@ -1737,14 +1854,35 @@ def main():
                             feedback_ate = time.time() + FEEDBACK_DURACAO
                             ultima_decisao_metodo = "CLIP"
 
+                        # 5) Nem OCR nem CLIP: encaminhar ao VLM
+                        else:
+                            _vlm_motivo = "clip_medio" if _clip_medio else "sem_rec"
+                            if usar_vlm:
+                                vlm_fila_pedidos.put({
+                                    "passagem_num": passagem_num,
+                                    "crop":         _sorted_fds[0]["crop"].copy(),
+                                    "clip_opiniao": _clip_opiniao,
+                                    "ocr_opiniao":  _ocr_match,
+                                    "nomes":        list(nomes),
+                                    "descricoes":   descricoes_vlm,
+                                    "vlm_motivo":   _vlm_motivo,
+                                    "dados_evento": {
+                                        "clip":    _clip_opiniao,
+                                        "sim":     (
+                                            _sim_clip if _sim_clip > 0
+                                            else passagem_clip_best["sim"]
+                                        ),
+                                        "origem":  "vlm",
+                                        "decisao": _decisao_pass,
+                                    },
+                                })
+                                vlm_pendentes   += 1
+                                _vlm_enfileirado = True
+
                         # quem_decidiu inicial para o relatorio
                         _quem_decidiu_init = (
                             _metodo_decidiu if _metodo_decidiu != "ninguem"
-                            else None if (
-                                usar_vlm
-                                and _decisao_pass == "SEM_REC"
-                                and _ocr_match == "nenhum"
-                            )
+                            else None if _vlm_enfileirado
                             else "ninguem"
                         )
 
@@ -1769,6 +1907,7 @@ def main():
                                 "ocr_texto":       _ocr_texto[:80],
                                 "ocr_rotacao":     _ocr_rot,
                                 "metodo_decidiu":  _quem_decidiu_init or "pendente",
+                                "vlm_motivo":      _vlm_motivo,
                             }, ensure_ascii=False, indent=2),
                             encoding="utf-8",
                         )
@@ -1786,27 +1925,11 @@ def main():
                             "ocr_texto":     _ocr_texto[:80],
                             "ocr_rotacao":   _ocr_rot,
                             "vlm_nome":      None,
+                            "vlm_texto":     None,
                             "vlm_duracao_s": None,
+                            "vlm_motivo":    _vlm_motivo,
                             "quem_decidiu":  _quem_decidiu_init,
                         })
-
-                        # VLM: apenas se OCR nao decidiu e CLIP nao reconheceu
-                        if (usar_vlm
-                                and _decisao_pass == "SEM_REC"
-                                and _ocr_match == "nenhum"):
-                            vlm_fila_pedidos.put({
-                                "passagem_num": passagem_num,
-                                "crop":         _sorted_fds[0]["crop"].copy(),
-                                "clip_opiniao": _clip_opiniao,
-                                "nomes":        list(nomes),
-                                "dados_evento": {
-                                    "clip":    _clip_opiniao,
-                                    "sim":     _sim_clip,
-                                    "origem":  "clip",
-                                    "decisao": _decisao_pass,
-                                },
-                            })
-                            vlm_pendentes += 1
 
                     # Resetar estado da passagem
                     passagem_ativa          = False
@@ -1815,6 +1938,7 @@ def main():
                     passagem_frames_total   = 0
                     passagem_inf_total      = 0
                     passagem_acertos        = []
+                    passagem_clip_best      = {"sim": 0.0, "prod": "", "marg": 0.0}
 
                     # Se foi cortada e ainda ha deteccao, abrir nova passagem imediatamente
                     if _cortada and det_valida:
@@ -1907,41 +2031,65 @@ def main():
         if usar_vlm:
             try:
                 while True:
-                    _res       = vlm_fila_respostas.get_nowait()
+                    _res        = vlm_fila_respostas.get_nowait()
                     vlm_pendentes -= 1
-                    _pass_num  = _res["passagem_num"]
-                    _vlm_nome  = _res["vlm"]
-                    _clip_log  = _res["clip"]
-                    _concordam = (_vlm_nome == _clip_log)
-                    _dados_v   = _res["dados_evento"]
-                    _vlm_dur   = _res.get("vlm_duracao", 0.0)
+                    _pass_num   = _res["passagem_num"]
+                    _vlm_nome   = _res["vlm"]
+                    _vlm_texto  = _res.get("vlm_texto", "")
+                    _vlm_motivo = _res.get("vlm_motivo", "")
+                    _clip_log   = _res["clip"]
+                    _ocr_log    = _res.get("ocr", "nenhum")
+                    _concordam  = (_vlm_nome == _clip_log)
+                    _dados_v    = _res["dados_evento"]
+                    _vlm_dur    = _res.get("vlm_duracao", 0.0)
                     _rp = next(
                         (p for p in relatorio_passagens if p["num"] == _pass_num),
                         None,
                     )
                     if _rp is not None:
                         _rp["vlm_nome"]      = _vlm_nome
+                        _rp["vlm_texto"]     = _vlm_texto
                         _rp["vlm_duracao_s"] = round(_vlm_dur, 2)
                     log_f.write(
-                        f"  VLM passagem={_pass_num}  clip={_clip_log}  vlm={_vlm_nome}"
-                        f"  concord={_concordam}  decisao_clip={_dados_v['decisao']}\n"
+                        f"  VLM passagem={_pass_num}  motivo={_vlm_motivo}"
+                        f"  clip={_clip_log}  ocr={_ocr_log}"
+                        f"  vlm={_vlm_nome}  texto='{_vlm_texto[:40]}'"
+                        f"  concord={_concordam}\n"
                     )
+                    # Determinar produto e origem final
                     nomes_set_vlm = set(nomes)
+                    _produto_final = ""
+                    _origem_final  = "vlm"
                     if _vlm_nome and _vlm_nome != "nenhum" and _vlm_nome in nomes_set_vlm:
+                        _produto_final = _vlm_nome
+                        _origem_final  = (
+                            "vlm_desempate" if _vlm_motivo == "desempate" else "vlm"
+                        )
+                    elif _vlm_texto and indice_ocr:
+                        # PRODUTO=nenhum mas TEXTO tem conteudo: casar com indice
+                        _kw_match = match_palavras(_vlm_texto, indice_ocr)
+                        if _kw_match != "nenhum":
+                            _produto_final = _kw_match
+                            _origem_final  = "vlm_texto"
+                            log_f.write(
+                                f"  VLM_TEXTO_MATCH  produto={_kw_match}"
+                                f"  texto='{_vlm_texto[:40]}'\n"
+                            )
+                    if _produto_final:
                         feedback_texto, feedback_cor = _processar_evento(
-                            "entrada", _vlm_nome, _dados_v["sim"],
+                            "entrada", _produto_final, _dados_v["sim"],
                             inventario, eventos, modo_evento="reconhecimento",
-                            origem="vlm",
+                            origem=_origem_final,
                         )
                         if _rp is not None:
-                            _rp["quem_decidiu"] = "vlm"
+                            _rp["quem_decidiu"] = _origem_final
                         _recorte_ev = frame[qy1:qy2, qx1:qx2]
                         if _recorte_ev.size > 0:
                             n_log_evento += 1
                             _salvar_crop_log(_recorte_ev, sessao_crops_dir,
-                                             "evento", n_log_evento, _vlm_nome)
+                                             "evento", n_log_evento, _produto_final)
                         feedback_ate = time.time() + FEEDBACK_DURACAO
-                        ultima_decisao_metodo = "VLM"
+                        ultima_decisao_metodo = _origem_final.upper().replace("_", " ")
                     else:
                         if _rp is not None:
                             _rp["quem_decidiu"] = "ninguem"
@@ -1963,6 +2111,9 @@ def main():
                 reconhec_info = "passagem: aguardando..."
         elif ultima_decisao_metodo:
             reconhec_info = f"dec: {ultima_decisao_metodo}"
+        if ultimo_ocr_texto:
+            _ocr_hud = ultimo_ocr_texto[:25].replace("\n", " ")
+            reconhec_info = (reconhec_info + "  " if reconhec_info else "") + f"ocr: {_ocr_hud}"
 
         # ---- Desenhar ----
         if direcao_ativa and modo_direcao == "linha":
@@ -2172,28 +2323,38 @@ def main():
             if _ocr_m != "nenhum":
                 rf.write(f"  ocr_texto:     {_p.get('ocr_texto', '')[:60]}\n")
                 rf.write(f"  ocr_rotacao:   {_p.get('ocr_rotacao', 0)}\n")
+            _vm = _p.get("vlm_motivo", "")
             if _p["vlm_nome"] is not None:
                 rf.write(
-                    f"  vlm:           {_p['vlm_nome']}  ({_p['vlm_duracao_s']:.1f}s)\n"
+                    f"  vlm:           {_p['vlm_nome']}  ({_p['vlm_duracao_s']:.1f}s)"
+                    f"  motivo={_vm}\n"
                 )
+                if _p.get("vlm_texto"):
+                    rf.write(f"  vlm_texto:     {_p['vlm_texto'][:60]}\n")
             else:
                 rf.write(f"  vlm:           (nao usado)\n")
             rf.write(
                 f"  quem_decidiu:  {_p.get('quem_decidiu') or '(pendente)'}\n"
             )
-        # Resumo por metodo
-        _n_met: dict = {"ocr": 0, "clip": 0, "vlm": 0, "ninguem": 0, "pendente": 0}
+        # Resumo por origem da decisao
+        _n_orig: dict = {
+            "ocr": 0, "clip": 0,
+            "vlm": 0, "vlm_texto": 0, "vlm_desempate": 0,
+            "nenhuma": 0, "pendente": 0,
+        }
         for _p in relatorio_passagens:
             _qd = _p.get("quem_decidiu")
             if _qd is None:
-                _n_met["pendente"] += 1
+                _n_orig["pendente"] += 1
+            elif _qd == "ninguem":
+                _n_orig["nenhuma"] += 1
             else:
-                _n_met[_qd] = _n_met.get(_qd, 0) + 1
+                _n_orig[_qd] = _n_orig.get(_qd, 0) + 1
         rf.write("-" * 60 + "\n")
-        rf.write("Resumo por metodo:\n")
-        for _met, _n in _n_met.items():
+        rf.write("Resumo por origem da decisao:\n")
+        for _orig, _n in _n_orig.items():
             if _n:
-                rf.write(f"  {_met}: {_n}\n")
+                rf.write(f"  {_orig}: {_n}\n")
     print(f"Relatorio       : {rel_path}")
 
 
