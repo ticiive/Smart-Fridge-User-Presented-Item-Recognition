@@ -89,6 +89,9 @@ YOLO_CLASSES = [
     "instant ramen packet",
     "package of cookies",
     "soda can",
+    "energy drink can",
+    "aluminium beverage can",
+    "canned drink",
     "plastic bottle",
     "cardboard food box",
     "person",
@@ -126,7 +129,7 @@ YOLO_FRUTA_PT = {
 _YOLO_FRUTA_SET = set(YOLO_CLASSES_FRUTA)  # lookup O(1)
 
 # Modo reconhecimento (--direcao nenhum): decisao ao fim da passagem
-PASSAGEM_TIMEOUT        = 8    # frames sem deteccao valida para encerrar a passagem
+PASSAGEM_TIMEOUT        = 14   # frames sem deteccao valida para encerrar a passagem
 PASSAGEM_INFERENCIA_N   = 2    # intervalo de inferencia durante a passagem (frames)
 MIN_ACERTOS_PASSAGEM    = 1    # minimo de inferencias aceitas para adicionar ao carrinho
 PASSAGEM_MIN_FRAMES     = 5    # passagens com menos frames sao ignoradas ao salvar
@@ -145,6 +148,11 @@ CLIP_MARGEM_ALTA  = 0.05   # margem minima para CLIP decidir diretamente
 
 # Descricoes em portugues para o prompt do VLM
 DESCRICOES_YAML = Path("catalogo_descricoes.yaml")
+
+_AVISO_OLLAMA = (
+    "ATENCAO: a etapa 3 (VLM) esta desligada nesta execucao. "
+    "Rode: nohup ollama serve > ~/ollama.log 2>&1 &"
+)
 
 # Trilha (--direcao area|linha)
 TRILHA_FRAMES_TIMEOUT = 10
@@ -1284,6 +1292,9 @@ def main():
             print("  VLM pronto.")
         except Exception as exc:
             print(f"  AVISO: Ollama nao encontrado ({exc}) — --vlm desativado.")
+            print(f"\n{'!'*70}")
+            print(_AVISO_OLLAMA)
+            print(f"{'!'*70}\n")
             usar_vlm = False
     vlm_fila_pedidos:   queue.Queue = queue.Queue()
     vlm_fila_respostas: queue.Queue = queue.Queue()
@@ -2296,11 +2307,20 @@ def main():
     log_f.close()
     print(f"Log de sessao : logs_demo/sessao_{sessao_ts}.txt")
     print(f"Recortes      : {sessao_crops_dir}  ({n_log_evento} arquivo(s))")
+    _vlm_foi_desligado = args.vlm and not usar_vlm
+    if _vlm_foi_desligado:
+        print(f"\n{'!'*70}")
+        print(_AVISO_OLLAMA)
+        print(f"{'!'*70}\n")
 
     relatorios_dir = Path("relatorios")
     relatorios_dir.mkdir(exist_ok=True)
     rel_path = relatorios_dir / f"demo_{sessao_ts}.txt"
     with open(rel_path, "w", encoding="utf-8") as rf:
+        if _vlm_foi_desligado:
+            rf.write(f"{'!'*60}\n")
+            rf.write(f"{_AVISO_OLLAMA}\n")
+            rf.write(f"{'!'*60}\n\n")
         rf.write(f"Sessao           : {sessao_ts}\n")
         rf.write(f"Passagens salvas : {len(relatorio_passagens)}\n")
         rf.write(f"Descartadas      : {len(relatorio_descartadas)}\n")
