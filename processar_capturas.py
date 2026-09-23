@@ -268,9 +268,14 @@ def coletar_imagens(sessao: Optional[str]) -> list[Path]:
         pasta = Path(sessao)
         if not pasta.is_dir():
             sys.exit(f"Sessao nao encontrada: {pasta}")
-        imagens = sorted(
-            p for p in pasta.iterdir() if p.suffix.lower() in EXTENSOES
-        )
+        for item in sorted(pasta.iterdir()):
+            if item.is_dir():
+                # subpasta passagem_NNN/ (novo formato)
+                imagens += sorted(
+                    p for p in item.iterdir() if p.suffix.lower() in EXTENSOES
+                )
+            elif item.suffix.lower() in EXTENSOES:
+                imagens.append(item)
     else:
         if LOGS_DEMO_DIR.is_dir():
             for subdir in sorted(LOGS_DEMO_DIR.iterdir()):
@@ -280,13 +285,20 @@ def coletar_imagens(sessao: Optional[str]) -> list[Path]:
                         if p.suffix.lower() in EXTENSOES
                     )
         if CAPTURAS_DIR.is_dir():
-            for item in sorted(CAPTURAS_DIR.iterdir()):
-                if item.is_dir():
-                    imagens += sorted(
-                        p for p in item.iterdir() if p.suffix.lower() in EXTENSOES
-                    )
-                elif item.suffix.lower() in EXTENSOES:
-                    imagens.append(item)
+            for sessao_dir in sorted(CAPTURAS_DIR.iterdir()):
+                if not sessao_dir.is_dir():
+                    if sessao_dir.suffix.lower() in EXTENSOES:
+                        imagens.append(sessao_dir)
+                    continue
+                for item in sorted(sessao_dir.iterdir()):
+                    if item.is_dir():
+                        # subpasta passagem_NNN/ (novo formato)
+                        imagens += sorted(
+                            p for p in item.iterdir()
+                            if p.suffix.lower() in EXTENSOES
+                        )
+                    elif item.suffix.lower() in EXTENSOES:
+                        imagens.append(item)
     return imagens
 
 

@@ -129,7 +129,7 @@ YOLO_FRUTA_PT = {
 _YOLO_FRUTA_SET = set(YOLO_CLASSES_FRUTA)  # lookup O(1)
 
 # Modo reconhecimento (--direcao nenhum): decisao ao fim da passagem
-PASSAGEM_TIMEOUT        = 14   # frames sem deteccao valida para encerrar a passagem
+PASSAGEM_TIMEOUT        = 11   # frames sem deteccao valida para encerrar a passagem
 PASSAGEM_INFERENCIA_N   = 2    # intervalo de inferencia durante a passagem (frames)
 MIN_ACERTOS_PASSAGEM    = 1    # minimo de inferencias aceitas para adicionar ao carrinho
 PASSAGEM_MIN_FRAMES     = 5    # passagens com menos frames sao ignoradas ao salvar
@@ -1423,6 +1423,13 @@ def main():
     # ---- estado do VLM em fila ----
     vlm_pendentes: int = 0
 
+    # ---- estado por passagem (decidida / descartada) ----
+    passagem_estado: dict = {}
+
+    # ---- aguardando VLM para encerrar ----
+    _aguardando_enc: bool  = False
+    _enc_deadline:   float = 0.0
+
     # ---- metodo que decidiu a ultima passagem (para HUD) ----
     ultima_decisao_metodo: str = ""
 
@@ -1748,10 +1755,12 @@ def main():
                             reverse=True,
                         )[:OCR_MAX_RECORTES]
                         passagem_num += 1
+                        _pass_dir = capturas_dir / f"passagem_{passagem_num:03d}"
+                        _pass_dir.mkdir(exist_ok=True)
                         _crop_paths: list = []
                         for _i_fd, _fd in enumerate(_sorted_fds):
                             _letra = chr(ord("a") + _i_fd)
-                            _cp = capturas_dir / f"passagem_{passagem_num:03d}_{_letra}.jpg"
+                            _cp = _pass_dir / f"recorte_{_letra}.jpg"
                             cv2.imwrite(str(_cp), _fd["crop"])
                             _crop_paths.append(_cp)
 
@@ -1792,9 +1801,12 @@ def main():
                             and passagem_clip_best["sim"] >= CLIP_LIMIAR_MEDIO
                         )
 
-                        _metodo_decidiu  = "ninguem"
-                        _vlm_enfileirado = False
-                        _vlm_motivo      = ""
+                        _metodo_decidiu        = "ninguem"
+                        _vlm_enfileirado       = False
+                        _vlm_motivo            = ""
+                        _produto_pass_decidido = ""
+                        # Crops para tentativas VLM (ate 2)
+                        _crops_vlm = [fd["crop"].copy() for fd in _sorted_fds[:2]]
 
                         # 2) Discordancia OCR vs CLIP
                         _discordancia = (
@@ -1812,7 +1824,9 @@ def main():
                             if usar_vlm:
                                 vlm_fila_pedidos.put({
                                     "passagem_num": passagem_num,
-                                    "crop":         _sorted_fds[0]["crop"].copy(),
+                                    "crop":         _crops_vlm[0],
+                                    "crops_todos":  _crops_vlm,
+                                    "tentativa":    0,
                                     "clip_opiniao": _clip_opiniao,
                                     "ocr_opiniao":  _ocr_match,
                                     "nomes":        list(nomes),
@@ -1831,7 +1845,9 @@ def main():
 
                         # 3) OCR decide (sem discordancia)
                         elif _ocr_match != "nenhum":
-                            _metodo_decidiu = "ocr"
+                            _metodo_decidiu        = "ocr"
+                            _produto_pass_decidido = _ocr_match
+                            passagem_estado[passagem_num] = "decidida"
                             feedback_texto, feedback_cor = _processar_evento(
                                 "entrada", _ocr_match, 1.0,
                                 inventario, eventos, modo_evento="reconhecimento",
@@ -1851,7 +1867,9 @@ def main():
 
                         # 4) CLIP decide (sim >= 0.66 e margem >= 0.05)
                         elif _clip_pode_decidir:
-                            _metodo_decidiu = "clip"
+                            _metodo_decidiu        = "clip"
+                            _produto_pass_decidido = vencedor
+                            passagem_estado[passagem_num] = "decidida"
                             feedback_texto, feedback_cor = _processar_evento(
                                 "entrada", vencedor, dados["best"],
                                 inventario, eventos, modo_evento="reconhecimento",
@@ -1871,7 +1889,9 @@ def main():
                             if usar_vlm:
                                 vlm_fila_pedidos.put({
                                     "passagem_num": passagem_num,
-                                    "crop":         _sorted_fds[0]["crop"].copy(),
+                                    "crop":         _crops_vlm[0],
+                                    "crops_todos":  _crops_vlm,
+                                    "tentativa":    0,
                                     "clip_opiniao": _clip_opiniao,
                                     "ocr_opiniao":  _ocr_match,
                                     "nomes":        list(nomes),
@@ -1896,6 +1916,11 @@ def main():
                             else None if _vlm_enfileirado
                             else "ninguem"
                         )
+                        _estado_init = (
+                            "decidida" if _metodo_decidiu in ("ocr", "clip")
+                            else "pendente" if _vlm_enfileirado
+                            else "descartada"
+                        )
 
                         # Salvar JSON de metadados
                         _sim_best = (
@@ -1903,7 +1928,7 @@ def main():
                             if _sorted_fds and _sorted_fds[0]["clip_sim"] is not None
                             else 0.0
                         )
-                        (capturas_dir / f"passagem_{passagem_num:03d}.json").write_text(
+                        (_pass_dir / "dados.json").write_text(
                             json.dumps({
                                 "horario":         datetime.now().isoformat(
                                     timespec="seconds"
@@ -1924,22 +1949,24 @@ def main():
                         )
 
                         relatorio_passagens.append({
-                            "num":           passagem_num,
-                            "horario":       datetime.now().isoformat(
+                            "num":              passagem_num,
+                            "horario":          datetime.now().isoformat(
                                 timespec="seconds"
                             ),
-                            "duracao_fr":    passagem_frames_total,
-                            "n_inferencias": passagem_inf_total,
-                            "decisao_clip":  _decisao_pass,
-                            "clip_vencedor": _clip_opiniao,
-                            "ocr_match":     _ocr_match,
-                            "ocr_texto":     _ocr_texto[:80],
-                            "ocr_rotacao":   _ocr_rot,
-                            "vlm_nome":      None,
-                            "vlm_texto":     None,
-                            "vlm_duracao_s": None,
-                            "vlm_motivo":    _vlm_motivo,
-                            "quem_decidiu":  _quem_decidiu_init,
+                            "duracao_fr":       passagem_frames_total,
+                            "n_inferencias":    passagem_inf_total,
+                            "decisao_clip":     _decisao_pass,
+                            "clip_vencedor":    _clip_opiniao,
+                            "ocr_match":        _ocr_match,
+                            "ocr_texto":        _ocr_texto[:80],
+                            "ocr_rotacao":      _ocr_rot,
+                            "vlm_nome":         None,
+                            "vlm_texto":        None,
+                            "vlm_duracao_s":    None,
+                            "vlm_motivo":       _vlm_motivo,
+                            "quem_decidiu":     _quem_decidiu_init,
+                            "produto_decidido": _produto_pass_decidido,
+                            "estado":           _estado_init,
                         })
 
                     # Resetar estado da passagem
@@ -2042,17 +2069,19 @@ def main():
         if usar_vlm:
             try:
                 while True:
-                    _res        = vlm_fila_respostas.get_nowait()
+                    _res         = vlm_fila_respostas.get_nowait()
                     vlm_pendentes -= 1
-                    _pass_num   = _res["passagem_num"]
-                    _vlm_nome   = _res["vlm"]
-                    _vlm_texto  = _res.get("vlm_texto", "")
-                    _vlm_motivo = _res.get("vlm_motivo", "")
-                    _clip_log   = _res["clip"]
-                    _ocr_log    = _res.get("ocr", "nenhum")
-                    _concordam  = (_vlm_nome == _clip_log)
-                    _dados_v    = _res["dados_evento"]
-                    _vlm_dur    = _res.get("vlm_duracao", 0.0)
+                    _pass_num    = _res["passagem_num"]
+                    _vlm_nome    = _res["vlm"]
+                    _vlm_texto   = _res.get("vlm_texto", "")
+                    _vlm_motivo  = _res.get("vlm_motivo", "")
+                    _vlm_tent    = _res.get("tentativa", 0)
+                    _crops_todos = _res.get("crops_todos", [])
+                    _clip_log    = _res["clip"]
+                    _ocr_log     = _res.get("ocr", "nenhum")
+                    _concordam   = (_vlm_nome == _clip_log)
+                    _dados_v     = _res["dados_evento"]
+                    _vlm_dur     = _res.get("vlm_duracao", 0.0)
                     _rp = next(
                         (p for p in relatorio_passagens if p["num"] == _pass_num),
                         None,
@@ -2061,14 +2090,25 @@ def main():
                         _rp["vlm_nome"]      = _vlm_nome
                         _rp["vlm_texto"]     = _vlm_texto
                         _rp["vlm_duracao_s"] = round(_vlm_dur, 2)
+
+                    # Ignorar se passagem ja foi decidida por outro metodo
+                    if passagem_estado.get(_pass_num) == "decidida":
+                        log_f.write(
+                            f"  PASSAGEM_JA_DECIDIDA  passagem={_pass_num}"
+                            f"  tentativa={_vlm_tent}  vlm={_vlm_nome}\n"
+                        )
+                        continue
+
                     log_f.write(
-                        f"  VLM passagem={_pass_num}  motivo={_vlm_motivo}"
+                        f"  VLM passagem={_pass_num}  tentativa={_vlm_tent}"
+                        f"  motivo={_vlm_motivo}"
                         f"  clip={_clip_log}  ocr={_ocr_log}"
                         f"  vlm={_vlm_nome}  texto='{_vlm_texto[:40]}'"
                         f"  concord={_concordam}\n"
                     )
+
                     # Determinar produto e origem final
-                    nomes_set_vlm = set(nomes)
+                    nomes_set_vlm  = set(nomes)
                     _produto_final = ""
                     _origem_final  = "vlm"
                     if _vlm_nome and _vlm_nome != "nenhum" and _vlm_nome in nomes_set_vlm:
@@ -2086,14 +2126,18 @@ def main():
                                 f"  VLM_TEXTO_MATCH  produto={_kw_match}"
                                 f"  texto='{_vlm_texto[:40]}'\n"
                             )
+
                     if _produto_final:
+                        passagem_estado[_pass_num] = "decidida"
                         feedback_texto, feedback_cor = _processar_evento(
                             "entrada", _produto_final, _dados_v["sim"],
                             inventario, eventos, modo_evento="reconhecimento",
                             origem=_origem_final,
                         )
                         if _rp is not None:
-                            _rp["quem_decidiu"] = _origem_final
+                            _rp["quem_decidiu"]     = _origem_final
+                            _rp["produto_decidido"] = _produto_final
+                            _rp["estado"]           = "decidida"
                         _recorte_ev = frame[qy1:qy2, qx1:qx2]
                         if _recorte_ev.size > 0:
                             n_log_evento += 1
@@ -2102,14 +2146,42 @@ def main():
                         feedback_ate = time.time() + FEEDBACK_DURACAO
                         ultima_decisao_metodo = _origem_final.upper().replace("_", " ")
                     else:
-                        if _rp is not None:
-                            _rp["quem_decidiu"] = "ninguem"
+                        # VLM nao reconheceu: tentar proximo recorte se disponivel
+                        if _vlm_tent == 0 and len(_crops_todos) > 1:
+                            log_f.write(
+                                f"  VLM_RETRY  passagem={_pass_num}  tentativa=1\n"
+                            )
+                            vlm_fila_pedidos.put({
+                                "passagem_num": _pass_num,
+                                "crop":         _crops_todos[1],
+                                "crops_todos":  _crops_todos,
+                                "tentativa":    1,
+                                "clip_opiniao": _clip_log,
+                                "ocr_opiniao":  _ocr_log,
+                                "nomes":        list(nomes),
+                                "descricoes":   descricoes_vlm,
+                                "vlm_motivo":   _vlm_motivo,
+                                "dados_evento": _dados_v,
+                            })
+                            vlm_pendentes += 1
+                        else:
+                            # Esgotou as tentativas
+                            log_f.write(
+                                f"  PASSAGEM_DESCARTADA_VLM  passagem={_pass_num}"
+                                f"  tentativas={_vlm_tent + 1}\n"
+                            )
+                            passagem_estado[_pass_num] = "descartada"
+                            if _rp is not None:
+                                _rp["quem_decidiu"] = "ninguem"
+                                _rp["estado"]       = "descartada"
             except queue.Empty:
                 pass
 
         # ---- Construir reconhec_info ----
         reconhec_info = ""
-        if usar_vlm and vlm_pendentes > 0:
+        if _aguardando_enc:
+            reconhec_info = f"aguardando VLM: {vlm_pendentes} resposta(s)"
+        elif usar_vlm and vlm_pendentes > 0:
             reconhec_info = f"VLM: {vlm_pendentes} na fila"
         elif not direcao_ativa and passagem_ativa:
             if passagem_acertos:
@@ -2162,13 +2234,30 @@ def main():
         tecla     = tecla_raw & 0xFF
 
         # ---- Teclas ----
-        if tecla in (ord("q"), ord("Q")):
-            imprimir_resumo(inventario, eventos)
-            if eventos or inventario:
-                jp, cp = salvar_inventario(inventario, eventos, inventario_dir)
-                print(f"\nInventario → {jp}")
-                print(f"Eventos   → {cp}")
-            break
+        # Aguardar conclusao do VLM antes de encerrar
+        if _aguardando_enc:
+            if vlm_pendentes == 0 or time.time() >= _enc_deadline:
+                if time.time() >= _enc_deadline and vlm_pendentes > 0:
+                    print(f"  Tempo esgotado: {vlm_pendentes} resposta(s) ignorada(s).")
+                imprimir_resumo(inventario, eventos)
+                if eventos or inventario:
+                    jp, cp = salvar_inventario(inventario, eventos, inventario_dir)
+                    print(f"\nInventario → {jp}")
+                    print(f"Eventos   → {cp}")
+                break
+
+        if tecla in (ord("q"), ord("Q")) and not _aguardando_enc:
+            if usar_vlm and vlm_pendentes > 0:
+                _aguardando_enc = True
+                _enc_deadline   = time.time() + 120
+                print(f"\naguardando {vlm_pendentes} resposta(s) do VLM (limite 120 s)...")
+            else:
+                imprimir_resumo(inventario, eventos)
+                if eventos or inventario:
+                    jp, cp = salvar_inventario(inventario, eventos, inventario_dir)
+                    print(f"\nInventario → {jp}")
+                    print(f"Eventos   → {cp}")
+                break
 
         elif tecla in (ord("+"), ord("=")):
             limiar = min(1.0, round(limiar + 0.01, 2))
@@ -2313,6 +2402,40 @@ def main():
         print(_AVISO_OLLAMA)
         print(f"{'!'*70}\n")
 
+    # ---- Tabela por passagem ----
+    _tab_linhas: list = [
+        "",
+        "=== PASSAGENS ===",
+        f"{'Num':>4}  {'dur':>4}  {'inf':>4}  {'decidido_por':<20}  produto",
+        "-" * 60,
+    ]
+    _n_decididas   = 0
+    _n_descartadas = 0
+    for _p in relatorio_passagens:
+        _est  = _p.get("estado", "?")
+        _qd   = str(_p.get("quem_decidiu") or "pendente")
+        _prod = _p.get("produto_decidido") or "-"
+        if _est == "decidida":
+            _n_decididas += 1
+        elif _est == "descartada":
+            _n_descartadas += 1
+        _tab_linhas.append(
+            f"{_p['num']:>4}  {_p['duracao_fr']:>4}  {_p['n_inferencias']:>4}"
+            f"  {_qd:<20}  {_prod}"
+        )
+    _tab_linhas.append("-" * 60)
+    _tab_linhas.append(
+        f"Total: {len(relatorio_passagens)} passagem(ns), "
+        f"{_n_decididas} decidida(s), {_n_descartadas} descartada(s)"
+    )
+    if inventario:
+        _cart_str = "  ".join(f"{qtd}x {p}" for p, qtd in sorted(inventario.items()))
+        _tab_linhas.append(f"Carrinho: {_cart_str}")
+    else:
+        _tab_linhas.append("Carrinho: (vazio)")
+    for _linha in _tab_linhas:
+        print(_linha)
+
     relatorios_dir = Path("relatorios")
     relatorios_dir.mkdir(exist_ok=True)
     rel_path = relatorios_dir / f"demo_{sessao_ts}.txt"
@@ -2375,6 +2498,10 @@ def main():
         for _orig, _n in _n_orig.items():
             if _n:
                 rf.write(f"  {_orig}: {_n}\n")
+        rf.write("\n")
+        for _linha in _tab_linhas:
+            if _linha:
+                rf.write(_linha.strip() + "\n")
     print(f"Relatorio       : {rel_path}")
 
 
